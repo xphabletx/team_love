@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:table_calendar/table_calendar.dart';
 import 'package:uuid/uuid.dart';
 import 'package:team_love_app/widgets/side_nav_drawer.dart';
+import 'package:team_love_app/services/input_service.dart';
+import 'package:team_love_app/services/calendar_events_service.dart';
 
 class CalendarScreen extends StatefulWidget {
   const CalendarScreen({super.key});
@@ -11,66 +13,58 @@ class CalendarScreen extends StatefulWidget {
 }
 
 class _CalendarScreenState extends State<CalendarScreen> {
-  // Master list of events (first/start occurrence + repeat/reminder metadata)
-  final List<_Event> _events = [];
   final _uuid = const Uuid();
-
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
   bool _showMonthEvents = true;
 
-  // ---- date helpers
+  @override
+  void initState() {
+    super.initState();
+    CalendarEvents.instance.addListener(_rebuild);
+  }
+
+  @override
+  void dispose() {
+    CalendarEvents.instance.removeListener(_rebuild);
+    super.dispose();
+  }
+
+  void _rebuild() => setState(() {});
+
   DateTime _d(DateTime x) => DateTime(x.year, x.month, x.day);
-  bool _sameDay(DateTime a, DateTime b) =>
-      a.year == b.year && a.month == b.month && a.day == b.day;
 
-  // ---- recurrence check for a single day
-  bool _occursOn(_Event e, DateTime day) {
-    final start = _d(e.date);
-    final target = _d(day);
-    if (target.isBefore(start)) return false;
-    if (_sameDay(start, target)) return true;
+  // Always show a clean YYYY-MM-DD (no time)
+  String _ymd(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
-    switch (e.repeat) {
-      case 'Daily':
-        return true; // every day after start
-      case 'Weekly':
-        return target.difference(start).inDays % 7 == 0;
-      case 'Biweekly':
-        return target.difference(start).inDays % 14 == 0;
-      case 'Monthly':
-        // naive same-day-of-month rule
-        return start.day == target.day;
-      case 'Yearly':
-        return start.month == target.month && start.day == target.day;
-      default:
-        return false; // 'None'
-    }
-  }
+  List<CalEvent> _eventsForDay(DateTime day) =>
+      CalendarEvents.instance.eventsOn(day);
 
-  // ---- collections for UI
-  List<_Event> _eventsForDay(DateTime day) =>
-      _events.where((e) => _occursOn(e, day)).toList();
-
-  List<_Event> _eventsForMonth(DateTime month) {
+  List<CalEvent> _eventsForMonth(DateTime month) {
     final last = DateTime(month.year, month.month + 1, 0);
-    // include an event once if it occurs on any day within this month
-    return _events.where((e) {
-      for (int d = 1; d <= last.day; d++) {
-        if (_occursOn(e, DateTime(month.year, month.month, d))) return true;
+    final set = <String>{};
+    final out = <CalEvent>[];
+    for (var d = 1; d <= last.day; d++) {
+      final day = DateTime(month.year, month.month, d);
+      for (final e in _eventsForDay(day)) {
+        if (set.add(e.id)) out.add(e);
       }
-      return false;
-    }).toList();
+    }
+    return out;
   }
 
-  // ---- editor
-  Future<void> _showEventSheet({DateTime? date, _Event? existing}) async {
+  // ---- editor (writes to service) ----
+  Future<void> _showEventSheet({DateTime? date, CalEvent? existing}) async {
     final titleCtrl = TextEditingController(text: existing?.title ?? '');
     DateTime selectedDate = _d(
       date ?? existing?.date ?? _selectedDay ?? _focusedDay,
     );
     String repeat = existing?.repeat ?? 'None';
     String reminder = existing?.reminder ?? 'None';
+    final everyCtrl = TextEditingController(
+      text: (existing?.every ?? 1).toString(),
+    );
 
     await showModalBottomSheet(
       context: context,
@@ -99,7 +93,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                   const SizedBox(height: 12),
-                  TextField(
+                  AppInputs.textField(
                     controller: titleCtrl,
                     decoration: const InputDecoration(
                       labelText: 'Title',
@@ -125,22 +119,39 @@ class _CalendarScreenState extends State<CalendarScreen> {
                     },
                   ),
                   const SizedBox(height: 12),
-                  DropdownMenu<String>(
-                    label: const Text('Repeat'),
-                    initialSelection: repeat,
-                    dropdownMenuEntries: const [
-                      DropdownMenuEntry(value: 'None', label: 'None'),
-                      DropdownMenuEntry(value: 'Daily', label: 'Daily'),
-                      DropdownMenuEntry(value: 'Weekly', label: 'Weekly'),
-                      DropdownMenuEntry(
-                        value: 'Biweekly',
-                        label: 'Every 2 weeks',
+                  Row(
+                    children: [
+                      Expanded(
+                        child: DropdownMenu<String>(
+                          label: const Text('Repeat'),
+                          initialSelection: repeat,
+                          dropdownMenuEntries: const [
+                            DropdownMenuEntry(value: 'None', label: 'None'),
+                            DropdownMenuEntry(value: 'Daily', label: 'Daily'),
+                            DropdownMenuEntry(value: 'Weekly', label: 'Weekly'),
+                            DropdownMenuEntry(
+                              value: 'Monthly',
+                              label: 'Monthly',
+                            ),
+                            DropdownMenuEntry(value: 'Yearly', label: 'Yearly'),
+                          ],
+                          onSelected: (val) =>
+                              setModalState(() => repeat = val ?? 'None'),
+                        ),
                       ),
-                      DropdownMenuEntry(value: 'Monthly', label: 'Monthly'),
-                      DropdownMenuEntry(value: 'Yearly', label: 'Yearly'),
+                      const SizedBox(width: 8),
+                      if (repeat != 'None')
+                        SizedBox(
+                          width: 80,
+                          child: AppInputs.textField(
+                            controller: everyCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'Every',
+                            ),
+                          ),
+                        ),
                     ],
-                    onSelected: (val) =>
-                        setModalState(() => repeat = val ?? 'None'),
                   ),
                   const SizedBox(height: 12),
                   DropdownMenu<String>(
@@ -171,25 +182,29 @@ class _CalendarScreenState extends State<CalendarScreen> {
                         Navigator.of(sheetCtx).pop();
                         return;
                       }
-                      setState(() {
-                        if (existing == null) {
-                          _events.add(
-                            _Event(
-                              id: _uuid.v4(),
-                              title: title,
-                              date: selectedDate,
-                              repeat: repeat,
-                              reminder: reminder,
-                            ),
-                          );
-                        } else {
-                          existing
-                            ..title = title
-                            ..date = selectedDate
-                            ..repeat = repeat
-                            ..reminder = reminder;
-                        }
-                      });
+                      final every = int.tryParse(everyCtrl.text) ?? 1;
+                      if (existing == null) {
+                        CalendarEvents.instance.add(
+                          CalEvent(
+                            id: _uuid.v4(),
+                            title: title,
+                            date: selectedDate,
+                            repeat: repeat,
+                            every: repeat == 'None' ? 1 : every,
+                            reminder: reminder,
+                          ),
+                        );
+                      } else {
+                        CalendarEvents.instance.upsert(
+                          existing.copyWith(
+                            title: title,
+                            date: selectedDate,
+                            repeat: repeat,
+                            every: repeat == 'None' ? 1 : every,
+                            reminder: reminder,
+                          ),
+                        );
+                      }
                       Navigator.of(sheetCtx).pop();
                     },
                     child: Text(
@@ -211,7 +226,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
         ? _eventsForMonth(_focusedDay)
         : _selectedDay != null
         ? _eventsForDay(_selectedDay!)
-        : <_Event>[];
+        : <CalEvent>[];
 
     return Scaffold(
       appBar: AppBar(
@@ -224,23 +239,16 @@ class _CalendarScreenState extends State<CalendarScreen> {
           ),
         ),
       ),
-
-      // 👉 Use your SideNavDrawer widget
-      // If SideNavDrawer already returns a Drawer, you can use `drawer: const SideNavDrawer(),`
-      // Most commonly it's drawer *content*, so we wrap it:
       drawer: const Drawer(child: SideNavDrawer()),
-
       body: Column(
         children: [
-          TableCalendar<_Event>(
+          TableCalendar<CalEvent>(
             focusedDay: _focusedDay,
             firstDay: DateTime.utc(2020, 1, 1),
             lastDay: DateTime.utc(2030, 12, 31),
             startingDayOfWeek: StartingDayOfWeek.monday,
             calendarFormat: CalendarFormat.month,
-            headerStyle: const HeaderStyle(
-              formatButtonVisible: false,
-            ), // no "2 weeks" button
+            headerStyle: const HeaderStyle(formatButtonVisible: false),
             eventLoader: _eventsForDay,
             selectedDayPredicate: (day) =>
                 _selectedDay != null && _d(day) == _d(_selectedDay!),
@@ -292,7 +300,9 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       return ListTile(
                         title: Text(ev.title),
                         subtitle: Text(
-                          '${_d(ev.date)} — Repeat: ${ev.repeat}, Reminder: ${ev.reminder}',
+                          '${_ymd(ev.date)} — Repeat: ${ev.repeat}'
+                          '${ev.repeat == 'None' ? '' : ' every ${ev.every ?? 1}'}'
+                          ' • Reminder: ${ev.reminder}',
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
                         onTap: () =>
@@ -309,20 +319,4 @@ class _CalendarScreenState extends State<CalendarScreen> {
       ),
     );
   }
-}
-
-class _Event {
-  final String id;
-  String title;
-  DateTime date; // first occurrence (start date)
-  String repeat; // None / Daily / Weekly / Biweekly / Monthly / Yearly
-  String reminder; // metadata only
-
-  _Event({
-    required this.id,
-    required this.title,
-    required this.date,
-    required this.repeat,
-    required this.reminder,
-  });
 }
