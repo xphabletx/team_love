@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "576026676741",
+    "project_id": "team-love-9c9b8",
+    "storage_bucket": "team-love-9c9b8.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:576026676741:android:3e501157d6d82ab9f2966c",
+        "android_client_info": {
+          "package_name": "com.example.team_love_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCHhtRz6hTqtCBhXkDr7nBv793tY4h961E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:576026676741:android:0e9ade98551ace77f2966c",
+        "android_client_info": {
+          "package_name": "com.teamlove.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCHhtRz6hTqtCBhXkDr7nBv793tY4h961E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

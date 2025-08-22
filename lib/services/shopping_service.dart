@@ -7,21 +7,36 @@ class ShoppingItem {
 }
 
 class ShoppingService extends ChangeNotifier {
+  static final instance = ShoppingService._();
   ShoppingService._();
-  static final ShoppingService instance = ShoppingService._();
 
   final List<ShoppingItem> _items = [];
   List<ShoppingItem> get items => List.unmodifiable(_items);
 
   void add(String name) {
-    if (name.trim().isEmpty) return;
-    _items.add(ShoppingItem(name: name.trim()));
+    _items.add(ShoppingItem(name: name));
     notifyListeners();
   }
 
-  void toggle(int index, bool value) {
-    if (index < 0 || index >= _items.length) return;
-    _items[index].done = value;
+  // ✅ Accepts either a ShoppingItem or a String (item name)
+  void remove(dynamic itemOrName) {
+    if (itemOrName is ShoppingItem) {
+      _items.remove(itemOrName);
+    } else if (itemOrName is String) {
+      _items.removeWhere((it) => it.name == itemOrName);
+    }
+    notifyListeners();
+  }
+
+  // ✅ Accepts a mixture of ShoppingItem and/or String names
+  void removeAll(Iterable<dynamic> itemsOrNames) {
+    final names = <String>{};
+    final objs = <ShoppingItem>{};
+    for (final x in itemsOrNames) {
+      if (x is ShoppingItem) objs.add(x);
+      if (x is String) names.add(x);
+    }
+    _items.removeWhere((it) => objs.contains(it) || names.contains(it.name));
     notifyListeners();
   }
 }

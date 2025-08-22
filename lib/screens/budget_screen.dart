@@ -3,9 +3,12 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../widgets/side_nav_drawer.dart';
 
-const _prefsKey = 'teamlove_budget_state_v1';
+import '../widgets/side_nav_drawer.dart';
+import '../services/input_service.dart';
+import '../services/calendar_events_service.dart';
+
+const _prefsKey = 'teamlove_budget_state_v2'; // bumped for new fields
 
 class BudgetScreen extends StatefulWidget {
   const BudgetScreen({super.key});
@@ -23,7 +26,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
   final List<_Envelope> _envelopes = [];
   final List<_Group> _groups = [];
 
-  // A–Z overlay state (single/envelope view only)
+  // A–Z overlay state
   static const _letters = [
     'A',
     'B',
@@ -53,10 +56,8 @@ class _BudgetScreenState extends State<BudgetScreen> {
     'Z',
   ];
   bool _indexVisible = false;
-  String? _activeLetter; // floating bubble + top header
+  String? _activeLetter;
   Timer? _hideIndexTimer;
-
-  // ==== lifecycle & persistence =============================================
 
   @override
   void initState() {
@@ -64,32 +65,93 @@ class _BudgetScreenState extends State<BudgetScreen> {
     _loadState();
   }
 
+  DateTime _ymd(DateTime d) => DateTime(d.year, d.month, d.day);
+  String _ymdKey(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  Future<void> _maybeResetEnvelopesForToday() async {
+    // Reset envelopes whose recurrence hits today and have reset enabled.
+    final today = _ymd(DateTime.now());
+    final todayKey = _ymdKey(today);
+    bool changed = false;
+
+    for (final e in _envelopes) {
+      if (e.resetOnRecurring != true) continue;
+      if (e.payDate == null) continue;
+
+      final repeat = e.payRepeat ?? 'None';
+      final every = (e.payEvery ?? 1);
+
+      // Build a transient CalEvent and ask the Calendar service
+      final ce = CalEvent(
+        id: 'tmp:${e.id}',
+        title: e.name,
+        date: _ymd(e.payDate!),
+        repeat: repeat,
+        every: every,
+        reminder: 'None',
+      );
+
+      final occurs = CalendarEvents.instance.occursOn(ce, today);
+      if (occurs && e.lastResetYmd != todayKey) {
+        e.balance = 0;
+        e.lastResetYmd = todayKey;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      setState(() {});
+      await _saveState();
+    }
+  }
+
   Future<void> _loadState() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_prefsKey);
-    if (raw == null) return;
+    if (raw != null) {
+      try {
+        final obj = jsonDecode(raw) as Map<String, dynamic>;
+        final envs = (obj['envelopes'] as List<dynamic>? ?? [])
+            .map((e) => _Envelope.fromJson(e as Map<String, dynamic>))
+            .toList();
+        final grps = (obj['groups'] as List<dynamic>? ?? [])
+            .map((g) => _Group.fromJson(g as Map<String, dynamic>))
+            .toList();
 
-    try {
-      final obj = jsonDecode(raw) as Map<String, dynamic>;
-      final envs = (obj['envelopes'] as List<dynamic>? ?? [])
-          .map((e) => _Envelope.fromJson(e as Map<String, dynamic>))
-          .toList();
-      final grps = (obj['groups'] as List<dynamic>? ?? [])
-          .map((g) => _Group.fromJson(g as Map<String, dynamic>))
-          .toList();
+        setState(() {
+          _envelopes
+            ..clear()
+            ..addAll(envs);
+          _groups
+            ..clear()
+            ..addAll(grps);
+          _sortEnvelopes();
 
-      setState(() {
-        _envelopes
-          ..clear()
-          ..addAll(envs);
-        _groups
-          ..clear()
-          ..addAll(grps);
-        _sortEnvelopes();
-      });
-    } catch (_) {
-      /* ignore malformed */
+          // (Optional) Rebuild calendar events for envelopes that have pay dates.
+          for (final e in _envelopes) {
+            if (e.payDate != null) {
+              CalendarEvents.instance.upsert(
+                CalEvent(
+                  id: 'env:${e.id}',
+                  title: 'Payment: ${e.name}',
+                  date: _ymd(e.payDate!),
+                  repeat: e.payRepeat ?? 'None',
+                  every: (e.payEvery ?? 1),
+                  reminder: 'None',
+                  meta: {'envelopeId': e.id},
+                ),
+              );
+            }
+          }
+        });
+      } catch (_) {
+        // ignore malformed
+      }
     }
+
+    // After loading, process any due resets for today.
+    await _maybeResetEnvelopesForToday();
   }
 
   Future<void> _saveState() async {
@@ -106,8 +168,6 @@ class _BudgetScreenState extends State<BudgetScreen> {
       (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
     );
   }
-
-  // ==== indexing & jump ======================================================
 
   Map<String, int> _firstIndexByLetter(List<_Envelope> list) {
     final map = <String, int>{};
@@ -146,11 +206,12 @@ class _BudgetScreenState extends State<BudgetScreen> {
   void _scheduleHideIndex() {
     _hideIndexTimer?.cancel();
     _hideIndexTimer = Timer(const Duration(milliseconds: 600), () {
-      if (mounted)
+      if (mounted) {
         setState(() {
           _indexVisible = false;
           _activeLetter = null;
         });
+      }
     });
   }
 
@@ -162,6 +223,12 @@ class _BudgetScreenState extends State<BudgetScreen> {
     final targetCtrl = TextEditingController();
     final balanceCtrl = TextEditingController();
 
+    DateTime? payDate;
+    bool recurring = false;
+    String repeatUnit = 'Monthly'; // Daily / Weekly / Monthly / Yearly
+    final everyCtrl = TextEditingController(text: '1');
+    bool resetOnRecurring = false; // NEW
+
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -172,77 +239,194 @@ class _BudgetScreenState extends State<BudgetScreen> {
           bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
           top: 16,
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('Create envelope', style: Theme.of(ctx).textTheme.titleMedium),
-            const SizedBox(height: 12),
-            TextField(
-              controller: nameCtrl,
-              decoration: const InputDecoration(labelText: 'Name'),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: targetCtrl,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
+        child: StatefulBuilder(
+          builder: (ctx, setSB) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Create envelope',
+                style: Theme.of(ctx).textTheme.titleMedium,
               ),
-              decoration: const InputDecoration(
-                prefixText: '£ ',
-                labelText: 'Target',
+              const SizedBox(height: 12),
+              AppInputs.textField(
+                controller: nameCtrl,
+                decoration: const InputDecoration(labelText: 'Name'),
               ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: balanceCtrl,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
+              const SizedBox(height: 12),
+              AppInputs.textField(
+                controller: targetCtrl,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(
+                  prefixText: '£ ',
+                  labelText: 'Target',
+                ),
               ),
-              decoration: const InputDecoration(
-                prefixText: '£ ',
-                labelText: 'Starting amount (optional)',
+              const SizedBox(height: 12),
+              AppInputs.textField(
+                controller: balanceCtrl,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(
+                  prefixText: '£ ',
+                  labelText: 'Starting amount (optional)',
+                ),
               ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton(
-              onPressed: () async {
-                final n = nameCtrl.text.trim();
-                final t =
-                    double.tryParse(targetCtrl.text.replaceAll(',', '')) ?? 0;
-                final b =
-                    double.tryParse(balanceCtrl.text.replaceAll(',', '')) ?? 0;
-                if (n.isEmpty || t <= 0) {
-                  Navigator.pop(ctx);
-                  return;
-                }
-                final first = _envelopes.isEmpty;
-                setState(() {
-                  _envelopes.add(
-                    _Envelope(
-                      id: _newId(),
-                      ownerId: currentUid,
-                      name: n,
-                      target: t,
-                      balance: b,
+              const SizedBox(height: 16),
+
+              // --- Pay date (optional) ---
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.event),
+                      label: Text(
+                        payDate == null
+                            ? 'Set pay date (optional)'
+                            : '${payDate!.year}-${payDate!.month.toString().padLeft(2, '0')}-${payDate!.day.toString().padLeft(2, '0')}',
+                      ),
+                      onPressed: () async {
+                        final picked = await showDatePicker(
+                          context: ctx,
+                          initialDate: DateTime.now(),
+                          firstDate: DateTime(2020),
+                          lastDate: DateTime(2100),
+                        );
+                        if (picked != null) {
+                          setSB(
+                            () => payDate = DateTime(
+                              picked.year,
+                              picked.month,
+                              picked.day,
+                            ),
+                          );
+                        }
+                      },
                     ),
-                  );
-                  _sortEnvelopes();
-                });
-                await _saveState();
-                if (mounted) Navigator.pop(ctx);
-                if (first && mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                        'Tip: use the + to add more envelopes or groups.',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+
+              // --- Recurring toggle + controls ---
+              Row(
+                children: [
+                  const Text('Recurring'),
+                  Switch(
+                    value: recurring,
+                    onChanged: (v) => setSB(() => recurring = v),
+                  ),
+                  const SizedBox(width: 8),
+                  if (recurring) ...[
+                    SizedBox(
+                      width: 64,
+                      child: AppInputs.textField(
+                        controller: everyCtrl,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(labelText: 'Every'),
                       ),
                     ),
+                    const SizedBox(width: 8),
+                    DropdownButton<String>(
+                      value: repeatUnit,
+                      onChanged: (v) =>
+                          setSB(() => repeatUnit = v ?? 'Monthly'),
+                      items: const [
+                        DropdownMenuItem(value: 'Daily', child: Text('days')),
+                        DropdownMenuItem(value: 'Weekly', child: Text('weeks')),
+                        DropdownMenuItem(
+                          value: 'Monthly',
+                          child: Text('months'),
+                        ),
+                        DropdownMenuItem(value: 'Yearly', child: Text('years')),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+
+              // NEW: reset toggle (only meaningful if recurring)
+              if (recurring)
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Reset starting amount each cycle'),
+                  value: resetOnRecurring,
+                  onChanged: (v) => setSB(() => resetOnRecurring = v),
+                ),
+
+              const SizedBox(height: 12),
+
+              FilledButton(
+                onPressed: () async {
+                  final n = nameCtrl.text.trim();
+                  final t =
+                      double.tryParse(targetCtrl.text.replaceAll(',', '')) ?? 0;
+                  final b =
+                      double.tryParse(balanceCtrl.text.replaceAll(',', '')) ??
+                      0;
+
+                  if (n.isEmpty || t <= 0) {
+                    Navigator.pop(ctx);
+                    return;
+                  }
+
+                  final env = _Envelope(
+                    id: _newId(),
+                    ownerId: currentUid,
+                    name: n,
+                    target: t,
+                    balance: b,
+                    payDate: payDate,
+                    payRepeat: (payDate != null && recurring)
+                        ? repeatUnit
+                        : 'None',
+                    payEvery: (payDate != null && recurring)
+                        ? (int.tryParse(everyCtrl.text) ?? 1)
+                        : null,
+                    resetOnRecurring: (payDate != null && recurring)
+                        ? resetOnRecurring
+                        : false,
                   );
-                }
-              },
-              child: const Text('Create'),
-            ),
-          ],
+
+                  final first = _envelopes.isEmpty;
+                  setState(() {
+                    _envelopes.add(env);
+                    _sortEnvelopes();
+                  });
+                  await _saveState();
+
+                  // Push to shared calendar if a pay date is set (date-only)
+                  if (env.payDate != null) {
+                    CalendarEvents.instance.upsert(
+                      CalEvent(
+                        id: 'env:${env.id}',
+                        title: 'Payment: ${env.name}',
+                        date: _ymd(env.payDate!),
+                        repeat: env.payRepeat ?? 'None',
+                        every: env.payEvery ?? 1,
+                        reminder: 'None',
+                        meta: {'envelopeId': env.id},
+                      ),
+                    );
+                  }
+
+                  if (mounted) Navigator.pop(ctx);
+                  if (first && mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Tip: use the + to add more envelopes or groups.',
+                        ),
+                      ),
+                    );
+                  }
+                },
+                child: const Text('Create'),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -254,7 +438,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Create group'),
-        content: TextField(
+        content: AppInputs.textField(
           controller: ctrl,
           decoration: const InputDecoration(labelText: 'Group name'),
         ),
@@ -270,9 +454,11 @@ class _BudgetScreenState extends State<BudgetScreen> {
                 Navigator.pop(ctx);
                 return;
               }
-              setState(() {
-                _groups.add(_Group(id: _newId(), name: name, memberIds: {}));
-              });
+              setState(
+                () => _groups.add(
+                  _Group(id: _newId(), name: name, memberIds: {}),
+                ),
+              );
               await _saveState();
               if (mounted) Navigator.pop(ctx);
             },
@@ -374,6 +560,20 @@ class _BudgetScreenState extends State<BudgetScreen> {
                             _sortEnvelopes();
                           });
                           await _saveState();
+                          // also update calendar event title if exists
+                          if (env.payDate != null) {
+                            CalendarEvents.instance.upsert(
+                              CalEvent(
+                                id: 'env:${env.id}',
+                                title: 'Payment: ${env.name}',
+                                date: _ymd(env.payDate!),
+                                repeat: env.payRepeat ?? 'None',
+                                every: env.payEvery ?? 1,
+                                reminder: 'None',
+                                meta: {'envelopeId': env.id},
+                              ),
+                            );
+                          }
                         },
                       );
                     },
@@ -396,7 +596,6 @@ class _BudgetScreenState extends State<BudgetScreen> {
   }
 
   void _onLongPressGroup(_Group group) {
-    // Manage members: checkbox list of all envelopes
     final selected = {...group.memberIds};
     showModalBottomSheet<void>(
       context: context,
@@ -484,7 +683,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
           children: [
             Text(title, style: Theme.of(ctx).textTheme.titleMedium),
             const SizedBox(height: 12),
-            TextField(
+            AppInputs.textField(
               controller: ctrl,
               keyboardType: const TextInputType.numberWithOptions(
                 decimal: true,
@@ -534,7 +733,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
           children: [
             Text(title, style: Theme.of(ctx).textTheme.titleMedium),
             const SizedBox(height: 12),
-            TextField(
+            AppInputs.textField(
               controller: ctrl,
               decoration: const InputDecoration(labelText: 'Name'),
             ),
@@ -578,6 +777,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
                 }
               });
               await _saveState();
+              CalendarEvents.instance.remove('env:${env.id}');
               if (mounted) Navigator.pop(ctx);
             },
             child: const Text('Delete'),
@@ -621,14 +821,14 @@ class _BudgetScreenState extends State<BudgetScreen> {
                 const SizedBox(height: 12),
                 DropdownButtonFormField<EnvelopeDropdownResult>(
                   items: items,
-                  value: target,
+                  initialValue: target, // fix deprecation
                   onChanged: (v) => setSB(() => target = v),
                   decoration: const InputDecoration(
                     labelText: 'Target envelope',
                   ),
                 ),
                 const SizedBox(height: 12),
-                TextField(
+                AppInputs.textField(
                   controller: amountCtrl,
                   keyboardType: const TextInputType.numberWithOptions(
                     decimal: true,
@@ -668,7 +868,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
     );
   }
 
-  // ==== UI pieces ============================================================
+  // ==== UI pieces (RESTORED) ================================================
 
   Widget _buildEnvelopeGrid(List<_Envelope> sorted, String? currentUid) {
     return GridView.builder(
@@ -697,7 +897,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
               child: Card(
                 clipBehavior: Clip.antiAlias,
                 child: InkWell(
-                  onTap: () {}, // future: envelope details/ledger
+                  onTap: () {}, // placeholder for envelope details
                   child: Padding(
                     padding: const EdgeInsets.all(12),
                     child: Column(
@@ -815,9 +1015,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
     const double itemHeight = 18.0; // tweak if you want larger/smaller
     final double barHeight = itemHeight * _letters.length;
 
-    // Helper to map local dy → letter index safely
     void selectByDy(double dy) {
-      // 0..barHeight  ->  0..25
       final idx = (dy ~/ itemHeight).clamp(0, _letters.length - 1);
       final letter = _letters[idx];
       if (_activeLetter != letter) {
@@ -828,7 +1026,6 @@ class _BudgetScreenState extends State<BudgetScreen> {
 
     return Stack(
       children: [
-        // Touch area pinned to the right; bar is centered vertically
         Positioned(
           right: 0,
           top: 0,
@@ -846,11 +1043,10 @@ class _BudgetScreenState extends State<BudgetScreen> {
               onVerticalDragEnd: (_) => _scheduleHideIndex(),
               child: AnimatedOpacity(
                 duration: const Duration(milliseconds: 120),
-                opacity: _indexVisible ? 1 : 0.15, // mostly hidden until touch
+                opacity: _indexVisible ? 1 : 0.15,
                 child: SizedBox(
                   width: 28,
-                  height:
-                      barHeight, // exact height so each letter has equal room
+                  height: barHeight,
                   child: Container(
                     decoration: BoxDecoration(
                       color: Theme.of(
@@ -928,19 +1124,6 @@ class _BudgetScreenState extends State<BudgetScreen> {
     );
   }
 
-  void _handleIndexInteraction(double localDy, List<_Envelope> sorted) {
-    _showIndex();
-    // Map dy within the 320px column to index 0..25
-    final per = (localDy / 320).clamp(0.0, 1.0);
-    var idx = (per * (_letters.length - 1)).round();
-    idx = idx.clamp(0, _letters.length - 1);
-    final letter = _letters[idx];
-    if (_activeLetter != letter) {
-      setState(() => _activeLetter = letter);
-      _jumpToLetter(letter, sorted);
-    }
-  }
-
   // ==== build ================================================================
 
   @override
@@ -987,7 +1170,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
             (_groupView
                 ? _buildGroupsList(currentUid)
                 : _buildEnvelopeGrid(sorted, currentUid)),
-          _buildAzOverlay(sorted), // hidden in group view
+          _buildAzOverlay(sorted),
         ],
       ),
       floatingActionButton: FloatingActionButton(
@@ -1050,7 +1233,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
   }
 }
 
-// ===== Models (JSON for local persistence; Firestore-ready later) ============
+// ===== Models (now include pay date + recurrence + reset) ====================
 
 class _Envelope {
   _Envelope({
@@ -1059,7 +1242,12 @@ class _Envelope {
     required this.name,
     required this.target,
     required this.balance,
-    this.groupId, // legacy, unused (memberships live in _Group)
+    this.groupId, // legacy
+    this.payDate, // optional scheduled payment
+    this.payRepeat = 'None', // None/Daily/Weekly/Monthly/Yearly
+    this.payEvery, // repeat every N units
+    this.resetOnRecurring = false, // NEW
+    this.lastResetYmd, // NEW: 'yyyy-MM-dd' of last auto reset
   });
 
   final String id;
@@ -1069,6 +1257,13 @@ class _Envelope {
   double balance;
   final String? groupId;
 
+  DateTime? payDate;
+  String? payRepeat;
+  int? payEvery;
+
+  bool resetOnRecurring;
+  String? lastResetYmd;
+
   Map<String, dynamic> toJson() => {
     'id': id,
     'ownerId': ownerId,
@@ -1076,6 +1271,17 @@ class _Envelope {
     'target': target,
     'balance': balance,
     'groupId': groupId,
+    'payDate': payDate == null
+        ? null
+        : DateTime(
+            payDate!.year,
+            payDate!.month,
+            payDate!.day,
+          ).toIso8601String(), // date-only
+    'payRepeat': payRepeat,
+    'payEvery': payEvery,
+    'resetOnRecurring': resetOnRecurring,
+    'lastResetYmd': lastResetYmd,
   };
 
   factory _Envelope.fromJson(Map<String, dynamic> m) => _Envelope(
@@ -1085,6 +1291,13 @@ class _Envelope {
     target: (m['target'] as num?)?.toDouble() ?? 0,
     balance: (m['balance'] as num?)?.toDouble() ?? 0,
     groupId: m['groupId'] as String?,
+    payDate: (m['payDate'] as String?) != null
+        ? DateTime.tryParse(m['payDate'] as String)
+        : null,
+    payRepeat: m['payRepeat'] as String? ?? 'None',
+    payEvery: (m['payEvery'] as num?)?.toInt(),
+    resetOnRecurring: (m['resetOnRecurring'] as bool?) ?? false,
+    lastResetYmd: m['lastResetYmd'] as String?,
   );
 }
 
