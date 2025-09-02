@@ -10,6 +10,9 @@ import 'workspace_setup_screen.dart';
 import 'account_screen.dart';
 import 'help_screen.dart';
 
+// 🔽 Add this import for the Recipes list screen
+import 'recipes_list_screen.dart'; // contains `RecipesListScreen`
+
 class TeamLoveScreen extends StatelessWidget {
   const TeamLoveScreen({super.key});
 
@@ -89,6 +92,17 @@ class TeamLoveScreen extends StatelessWidget {
                   MaterialPageRoute(builder: (_) => const ShoppingScreen()),
                 ),
               ),
+
+              // ✅ New Recipes tile
+              _NavCard(
+                icon: Icons.menu_book_outlined,
+                label: 'Recipes',
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const RecipesListScreen()),
+                ),
+              ),
+
               _NavCard(
                 icon: Icons.group_work_outlined,
                 label: 'Workspace',

@@ -1,429 +1,634 @@
+// ignore_for_file: prefer_const_constructors, prefer_const_literals_to_create_immutables
+
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:flutter/services.dart'; // Clipboard
 
 import '../widgets/side_nav_drawer.dart';
 import '../services/input_service.dart';
 import '../services/calendar_events_service.dart';
+import 'envelope_groups_screen.dart';
+import 'ledger_screen.dart';
+import 'dart:math' as math;
 
-const _prefsKey = 'teamlove_budget_state_v2'; // bumped for new fields
+import 'package:cloud_firestore/cloud_firestore.dart';
+import '../services/workspace_session.dart';
+import '../services/workspace_service.dart';
+
+// prefs
+const _prefsKeyBudgetCats = 'teamlove_budget_categories_v3'; // bumped
+const _prefsKeyBudgetIncome = 'teamlove_budget_income_v3';
+
+/// Hook to your ledger. Replace the stub as you wire spending.
+class LedgerService {
+  LedgerService._();
+  static final instance = LedgerService._();
+
+  double sumSpentForCategoryMonth(String categoryId, DateTime monthStart) {
+    return 0; // stub – return real spent for this category & month
+  }
+}
 
 class BudgetScreen extends StatefulWidget {
   const BudgetScreen({super.key});
+
   @override
   State<BudgetScreen> createState() => _BudgetScreenState();
 }
 
 class _BudgetScreenState extends State<BudgetScreen> {
-  final _scrollController = ScrollController();
+  // Firestore workspace-scoped storage (optional)
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  String? _wsId; // current workspace id (null => local prefs mode)
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _catsSub;
 
-  // Views
-  bool _groupView = false;
+  bool get _useFirestore => _wsId != null;
 
-  // Data (locally persisted for now)
-  final List<_Envelope> _envelopes = [];
-  final List<_Group> _groups = [];
+  Future<void> _saveIncome() async {
+    if (_useFirestore) {
+      await _metaDoc.set({
+        'monthlyIncome': _monthlyIncome,
+      }, SetOptions(merge: true));
+    } else {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _prefsKeyBudgetIncome,
+        jsonEncode({'monthlyIncome': _monthlyIncome}),
+      );
+    }
+  }
 
-  // A–Z overlay state
-  static const _letters = [
-    'A',
-    'B',
-    'C',
-    'D',
-    'E',
-    'F',
-    'G',
-    'H',
-    'I',
-    'J',
-    'K',
-    'L',
-    'M',
-    'N',
-    'O',
-    'P',
-    'Q',
-    'R',
-    'S',
-    'T',
-    'U',
-    'V',
-    'W',
-    'X',
-    'Y',
-    'Z',
-  ];
-  bool _indexVisible = false;
-  String? _activeLetter;
-  Timer? _hideIndexTimer;
+  Future<void> _upsertCat(BudgetCategory c) async {
+    if (!_useFirestore) return;
+    await _catsCol.doc(c.id).set(c.toJson(), SetOptions(merge: true));
+  }
 
+  Future<void> _deleteCatsByIds(Iterable<String> ids) async {
+    if (!_useFirestore) return;
+    final batch = _db.batch();
+    for (final id in ids) {
+      batch.delete(_catsCol.doc(id));
+    }
+    await batch.commit();
+  }
+
+  // Collect ids: id + all descendants (based on current _cats list)
+  Set<String> _collectDescendantIds(String id) {
+    final out = <String>{};
+    void walk(String x) {
+      out.add(x);
+      for (final k in _childrenOf(x)) {
+        walk(k.id);
+      }
+    }
+
+    walk(id);
+    return out;
+  }
+
+  // ---- Firestore helpers (valid only when _wsId != null) ----
+  CollectionReference<Map<String, dynamic>> get _catsCol =>
+      _db.collection('workspaces').doc(_wsId).collection('budgetCategories');
+
+  DocumentReference<Map<String, dynamic>> get _metaDoc =>
+      _db.collection('workspaces').doc(_wsId).collection('budget').doc('meta');
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+
+    final session = WorkspaceSession.of(context);
+    final newId = session.workspaceId;
+
+    if (newId == _wsId) return; // nothing changed
+
+    // Tear down old listener if switching workspaces
+    _catsSub?.cancel();
+    _catsSub = null;
+    _wsId = newId;
+
+    if (_wsId == null) {
+      // No workspace -> keep local prefs (existing behavior)
+      return;
+    }
+
+    // --- Firestore mode: live-listen to categories for this workspace ---
+    _catsSub = _catsCol.orderBy('name').snapshots().listen((snap) {
+      final list = snap.docs
+          .map((d) => BudgetCategory.fromJson(d.data()))
+          .toList();
+      setState(() {
+        _cats
+          ..clear()
+          ..addAll(list);
+      });
+    });
+
+    // Load meta (monthlyIncome)
+    _metaDoc.get().then((doc) {
+      final data = doc.data();
+      if (data != null) {
+        final mi = (data['monthlyIncome'] as num?)?.toDouble() ?? 0.0;
+        setState(() {
+          _monthlyIncome = mi;
+          if (!_incomeFocus.hasFocus) {
+            _incomeCtrl.text = mi == 0 ? '' : mi.toStringAsFixed(0);
+          }
+        });
+      }
+    });
+  }
+
+  // Main tabs: 0=Budget, 1=Ledger, 2=Envelopes, 3=Groups
+  final PageController _page = PageController(initialPage: 0);
+  int _tab = 0;
+
+  // Use a distinct key per EnvelopeGroupsScreen to avoid duplicate GlobalKey errors.
+  final GlobalKey<EnvelopeGroupsScreenState> _egKey1 =
+      GlobalKey<EnvelopeGroupsScreenState>(); // for tab 2 (activeChildTab: 1)
+  final GlobalKey<EnvelopeGroupsScreenState> _egKey2 =
+      GlobalKey<EnvelopeGroupsScreenState>(); // for tab 3 (activeChildTab: 2)
+
+  // ===== Budget state =====
+  final List<BudgetCategory> _cats = [];
+  final Map<String, bool> _expanded = {};
+  double _monthlyIncome = 0;
+
+  // Scrollers (freeze left column, scroll right table)
+  final ScrollController _budgetVert = ScrollController();
+  final ScrollController _budgetNamesVert = ScrollController();
+  final ScrollController _budgetHoriz = ScrollController();
+
+  // Persistent controllers & focus for money fields (avoid cursor jumps)
+  final Map<String, TextEditingController> _amountCtrls = {};
+  final Map<String, FocusNode> _amountFocus = {};
+  final Map<String, Timer?> _moneyDebounce = {};
+
+  // Inputs up top
+  late final TextEditingController _incomeCtrl;
+  final FocusNode _incomeFocus = FocusNode();
+  Timer? _incomeDebounce;
+
+  // Right-side column width (single Amount column)
+  static const double _wAmount = 160;
+  static const double _kTableWidth = _wAmount;
+
+  // Month context
+  DateTime _monthStart = DateTime(DateTime.now().year, DateTime.now().month, 1);
+
+  // ===== lifecycle =====
   @override
   void initState() {
     super.initState();
-    _loadState();
+    _incomeCtrl = TextEditingController();
+
+    _loadBudgetPrefs();
+
+    // keep left names + right table in vertical sync
+    _budgetVert.addListener(() {
+      if (_budgetNamesVert.hasClients &&
+          _budgetNamesVert.offset != _budgetVert.offset) {
+        _budgetNamesVert.jumpTo(_budgetVert.offset);
+      }
+    });
+    _budgetNamesVert.addListener(() {
+      if (_budgetVert.hasClients &&
+          _budgetVert.offset != _budgetNamesVert.offset) {
+        _budgetVert.jumpTo(_budgetNamesVert.offset);
+      }
+    });
   }
 
+  @override
+  void dispose() {
+    _catsSub?.cancel();
+    // cancel timers
+    _incomeDebounce?.cancel();
+    for (final t in _moneyDebounce.values) {
+      t?.cancel();
+    }
+
+    // dispose focus & controllers
+    _incomeFocus.dispose();
+    for (final f in _amountFocus.values) f.dispose();
+    for (final c in _amountCtrls.values) c.dispose();
+    _incomeCtrl.dispose();
+
+    // dispose scroll/page controllers
+    _page.dispose();
+    _budgetVert.dispose();
+    _budgetNamesVert.dispose();
+    _budgetHoriz.dispose();
+
+    super.dispose();
+  }
+
+  // ===== Helpers / persistence =====
   DateTime _ymd(DateTime d) => DateTime(d.year, d.month, d.day);
-  String _ymdKey(DateTime d) =>
-      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+  String _newId() => DateTime.now().microsecondsSinceEpoch.toString();
 
-  Future<void> _maybeResetEnvelopesForToday() async {
-    // Reset envelopes whose recurrence hits today and have reset enabled.
-    final today = _ymd(DateTime.now());
-    final todayKey = _ymdKey(today);
-    bool changed = false;
-
-    for (final e in _envelopes) {
-      if (e.resetOnRecurring != true) continue;
-      if (e.payDate == null) continue;
-
-      final repeat = e.payRepeat ?? 'None';
-      final every = (e.payEvery ?? 1);
-
-      // Build a transient CalEvent and ask the Calendar service
-      final ce = CalEvent(
-        id: 'tmp:${e.id}',
-        title: e.name,
-        date: _ymd(e.payDate!),
-        repeat: repeat,
-        every: every,
-        reminder: 'None',
-      );
-
-      final occurs = CalendarEvents.instance.occursOn(ce, today);
-      if (occurs && e.lastResetYmd != todayKey) {
-        e.balance = 0;
-        e.lastResetYmd = todayKey;
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      setState(() {});
-      await _saveState();
-    }
-  }
-
-  Future<void> _loadState() async {
+  Future<void> _loadBudgetPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_prefsKey);
-    if (raw != null) {
+
+    // income
+    final rawIncome = prefs.getString(_prefsKeyBudgetIncome);
+    if (rawIncome != null) {
       try {
-        final obj = jsonDecode(raw) as Map<String, dynamic>;
-        final envs = (obj['envelopes'] as List<dynamic>? ?? [])
-            .map((e) => _Envelope.fromJson(e as Map<String, dynamic>))
-            .toList();
-        final grps = (obj['groups'] as List<dynamic>? ?? [])
-            .map((g) => _Group.fromJson(g as Map<String, dynamic>))
-            .toList();
-
-        setState(() {
-          _envelopes
-            ..clear()
-            ..addAll(envs);
-          _groups
-            ..clear()
-            ..addAll(grps);
-          _sortEnvelopes();
-
-          // (Optional) Rebuild calendar events for envelopes that have pay dates.
-          for (final e in _envelopes) {
-            if (e.payDate != null) {
-              CalendarEvents.instance.upsert(
-                CalEvent(
-                  id: 'env:${e.id}',
-                  title: 'Payment: ${e.name}',
-                  date: _ymd(e.payDate!),
-                  repeat: e.payRepeat ?? 'None',
-                  every: (e.payEvery ?? 1),
-                  reminder: 'None',
-                  meta: {'envelopeId': e.id},
-                ),
-              );
-            }
-          }
-        });
-      } catch (_) {
-        // ignore malformed
-      }
+        final m = jsonDecode(rawIncome) as Map<String, dynamic>;
+        _monthlyIncome = (m['monthlyIncome'] as num?)?.toDouble() ?? 0.0;
+        if (!_incomeFocus.hasFocus) {
+          _incomeCtrl.text = _monthlyIncome == 0
+              ? ''
+              : _monthlyIncome.toStringAsFixed(0);
+        }
+      } catch (_) {}
     }
 
-    // After loading, process any due resets for today.
-    await _maybeResetEnvelopesForToday();
+    // categories
+    final rawCats = prefs.getString(_prefsKeyBudgetCats);
+    if (rawCats != null) {
+      try {
+        final list = (jsonDecode(rawCats) as List<dynamic>)
+            .map((e) => BudgetCategory.fromJson(e as Map<String, dynamic>))
+            .toList();
+        setState(() {
+          _cats
+            ..clear()
+            ..addAll(list);
+        });
+      } catch (_) {}
+    } else {
+      // Seed your requested sample
+      final car = BudgetCategory(id: _newId(), name: 'Car');
+      final home = BudgetCategory(id: _newId(), name: 'Home');
+      final utilities = BudgetCategory(id: _newId(), name: 'Utilities');
+      final envelopes = BudgetCategory(id: _newId(), name: 'Envelopes');
+      _cats.addAll([car, home, utilities, envelopes]);
+
+      _cats.addAll([
+        BudgetCategory(
+          id: _newId(),
+          name: 'Insurance',
+          parentId: car.id,
+          spent: 50,
+        ),
+        BudgetCategory(
+          id: _newId(),
+          name: 'Furniture',
+          parentId: home.id,
+          spent: 75,
+        ),
+        BudgetCategory(
+          id: _newId(),
+          name: 'Electricity',
+          parentId: utilities.id,
+          spent: 100,
+        ),
+        BudgetCategory(
+          id: _newId(),
+          name: 'Recreation',
+          parentId: envelopes.id,
+          spent: 100,
+        ),
+        BudgetCategory(
+          id: _newId(),
+          name: 'Birthdays',
+          parentId: envelopes.id,
+          spent: 25,
+        ),
+      ]);
+      await _saveBudgetPrefs();
+    }
+
+    setState(() {});
   }
 
-  Future<void> _saveState() async {
+  Future<void> _saveBudgetPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    final data = jsonEncode({
-      'envelopes': _envelopes.map((e) => e.toJson()).toList(),
-      'groups': _groups.map((g) => g.toJson()).toList(),
-    });
-    await prefs.setString(_prefsKey, data);
-  }
-
-  void _sortEnvelopes() {
-    _envelopes.sort(
-      (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+    await prefs.setString(
+      _prefsKeyBudgetCats,
+      jsonEncode(_cats.map((e) => e.toJson()).toList()),
+    );
+    await prefs.setString(
+      _prefsKeyBudgetIncome,
+      jsonEncode({'monthlyIncome': _monthlyIncome}),
     );
   }
 
-  Map<String, int> _firstIndexByLetter(List<_Envelope> list) {
-    final map = <String, int>{};
-    for (var i = 0; i < list.length; i++) {
-      final n = list[i].name.trim().toUpperCase();
-      if (n.isEmpty) continue;
-      map.putIfAbsent(n[0], () => i);
+  // Tree helpers
+  List<BudgetCategory> _roots() =>
+      _cats.where((c) => c.parentId == null).toList();
+  List<BudgetCategory> _childrenOf(String id) =>
+      _cats.where((c) => c.parentId == id).toList();
+  bool _isRoot(String id) => _cats.any((c) => c.id == id && c.parentId == null);
+
+  double _sumSpent(String id) {
+    final kids = _childrenOf(id);
+    if (kids.isEmpty) {
+      // Manual amount for leaf. Swap for LedgerService when wired.
+      return _cats.firstWhere((e) => e.id == id).spent ?? 0.0;
+      // Or: return LedgerService.instance.sumSpentForCategoryMonth(id, _monthStart);
     }
-    return map;
+    double total = 0;
+    for (final k in kids) {
+      total += _sumSpent(k.id);
+    }
+    return total;
   }
 
-  void _scrollToGridIndex(int itemIndex) {
-    const columns = 2;
-    const tileHeight = 190.0;
-    const rowSpacing = 12.0;
-    final row = (itemIndex / columns).floor();
-    final offset = row * (tileHeight + rowSpacing);
-    _scrollController.animateTo(
-      offset.toDouble(),
-      duration: const Duration(milliseconds: 240),
-      curve: Curves.easeOutCubic,
-    );
+  // Summary numbers
+  double get _totalOutgoings {
+    double total = 0;
+    for (final r in _roots()) {
+      total += _sumSpent(r.id);
+    }
+    return total;
   }
 
-  void _jumpToLetter(String letter, List<_Envelope> list) {
-    final map = _firstIndexByLetter(list);
-    final idx = map[letter];
-    if (idx != null) _scrollToGridIndex(idx);
-  }
+  double get _remaining => (_monthlyIncome) - _totalOutgoings;
 
-  void _showIndex() {
-    _hideIndexTimer?.cancel();
-    setState(() => _indexVisible = true);
-  }
-
-  void _scheduleHideIndex() {
-    _hideIndexTimer?.cancel();
-    _hideIndexTimer = Timer(const Duration(milliseconds: 600), () {
-      if (mounted) {
-        setState(() {
-          _indexVisible = false;
-          _activeLetter = null;
-        });
-      }
+  // Month nav
+  void _shiftMonth(int delta) {
+    setState(() {
+      _monthStart = DateTime(_monthStart.year, _monthStart.month + delta, 1);
     });
   }
 
-  // ==== creation & editing ===================================================
+  String _monthLabel(DateTime d) {
+    const months = [
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December',
+    ];
+    return '${months[d.month - 1]} ${d.year}';
+  }
 
-  Future<void> _createEnvelope() async {
-    final currentUid = FirebaseAuth.instance.currentUser?.uid ?? 'me';
-    final nameCtrl = TextEditingController();
-    final targetCtrl = TextEditingController();
-    final balanceCtrl = TextEditingController();
+  // ===== Add / Edit / Delete =====
+  Future<void> _addRootCategory() async {
+    await _editCategory(parentId: null);
+  }
 
-    DateTime? payDate;
-    bool recurring = false;
-    String repeatUnit = 'Monthly'; // Daily / Weekly / Monthly / Yearly
-    final everyCtrl = TextEditingController(text: '1');
-    bool resetOnRecurring = false; // NEW
+  Future<void> _addSubCategory(String parentId) async {
+    // Enforce 2 levels only (parents are roots)
+    if (!_isRoot(parentId)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Only one level of subcategories is allowed.'),
+        ),
+      );
+      return;
+    }
+    await _editCategory(parentId: parentId);
+  }
+
+  Future<void> _editCategory({
+    String? parentId,
+    BudgetCategory? existing,
+  }) async {
+    final isParent = existing == null
+        ? (parentId == null)
+        : (existing.parentId == null);
+
+    final nameCtrl = TextEditingController(text: existing?.name ?? '');
+    final amountCtrl = TextEditingController(
+      text: (!isParent ? (existing?.spent ?? 0) : 0).toStringAsFixed(0),
+    );
+
+    DateTime? startDate = existing?.startDate;
+    bool recurring = (existing?.repeat ?? 'None') != 'None';
+    String repeatUnit = existing?.repeat ?? 'Monthly';
+    const allowedRepeats = ['Daily', 'Weekly', 'Monthly', 'Yearly'];
+    if (!allowedRepeats.contains(repeatUnit)) repeatUnit = 'Monthly';
+    final everyCtrl = TextEditingController(
+      text: (existing?.every ?? 1).toString(),
+    );
 
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
-          top: 16,
-        ),
-        child: StatefulBuilder(
-          builder: (ctx, setSB) => Column(
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSB) => Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 16,
+            bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
+          ),
+          child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                'Create envelope',
+                existing == null ? 'Add category' : 'Edit category',
                 style: Theme.of(ctx).textTheme.titleMedium,
               ),
               const SizedBox(height: 12),
               AppInputs.textField(
                 controller: nameCtrl,
-                decoration: const InputDecoration(labelText: 'Name'),
-              ),
-              const SizedBox(height: 12),
-              AppInputs.textField(
-                controller: targetCtrl,
-                keyboardType: const TextInputType.numberWithOptions(
-                  decimal: true,
-                ),
-                decoration: const InputDecoration(
-                  prefixText: '£ ',
-                  labelText: 'Target',
+                decoration: InputDecoration(
+                  labelText: isParent ? 'Main category name' : 'Subcategory',
                 ),
               ),
               const SizedBox(height: 12),
-              AppInputs.textField(
-                controller: balanceCtrl,
-                keyboardType: const TextInputType.numberWithOptions(
-                  decimal: true,
-                ),
-                decoration: const InputDecoration(
-                  prefixText: '£ ',
-                  labelText: 'Starting amount (optional)',
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              // --- Pay date (optional) ---
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      icon: const Icon(Icons.event),
-                      label: Text(
-                        payDate == null
-                            ? 'Set pay date (optional)'
-                            : '${payDate!.year}-${payDate!.month.toString().padLeft(2, '0')}-${payDate!.day.toString().padLeft(2, '0')}',
-                      ),
-                      onPressed: () async {
-                        final picked = await showDatePicker(
-                          context: ctx,
-                          initialDate: DateTime.now(),
-                          firstDate: DateTime(2020),
-                          lastDate: DateTime(2100),
-                        );
-                        if (picked != null) {
-                          setSB(
-                            () => payDate = DateTime(
-                              picked.year,
-                              picked.month,
-                              picked.day,
-                            ),
-                          );
-                        }
-                      },
-                    ),
+              if (!isParent) // children only
+                AppInputs.textField(
+                  controller: amountCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    prefixText: '£ ',
+                    labelText: 'Amount per month',
                   ),
-                ],
-              ),
-              const SizedBox(height: 8),
-
-              // --- Recurring toggle + controls ---
-              Row(
-                children: [
-                  const Text('Recurring'),
-                  Switch(
-                    value: recurring,
-                    onChanged: (v) => setSB(() => recurring = v),
-                  ),
-                  const SizedBox(width: 8),
-                  if (recurring) ...[
-                    SizedBox(
-                      width: 64,
-                      child: AppInputs.textField(
-                        controller: everyCtrl,
-                        keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(labelText: 'Every'),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    DropdownButton<String>(
-                      value: repeatUnit,
-                      onChanged: (v) =>
-                          setSB(() => repeatUnit = v ?? 'Monthly'),
-                      items: const [
-                        DropdownMenuItem(value: 'Daily', child: Text('days')),
-                        DropdownMenuItem(value: 'Weekly', child: Text('weeks')),
-                        DropdownMenuItem(
-                          value: 'Monthly',
-                          child: Text('months'),
+                ),
+              const SizedBox(height: 12),
+              if (!isParent) // children only: schedule/recurring
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.event),
+                        label: Text(
+                          startDate == null
+                              ? 'Set start date (optional)'
+                              : '${startDate!.year}-${startDate!.month.toString().padLeft(2, '0')}-${startDate!.day.toString().padLeft(2, '0')}',
                         ),
-                        DropdownMenuItem(value: 'Yearly', child: Text('years')),
-                      ],
+                        onPressed: () async {
+                          final picked = await showDatePicker(
+                            context: ctx,
+                            initialDate: DateTime.now(),
+                            firstDate: DateTime(2020),
+                            lastDate: DateTime(2100),
+                          );
+                          if (picked != null) {
+                            setSB(
+                              () => startDate = DateTime(
+                                picked.year,
+                                picked.month,
+                                picked.day,
+                              ),
+                            );
+                          }
+                        },
+                      ),
                     ),
                   ],
-                ],
-              ),
-
-              // NEW: reset toggle (only meaningful if recurring)
-              if (recurring)
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Reset starting amount each cycle'),
-                  value: resetOnRecurring,
-                  onChanged: (v) => setSB(() => resetOnRecurring = v),
                 ),
-
+              if (!isParent) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const Text('Recurring'),
+                    Switch(
+                      value: recurring,
+                      onChanged: (v) => setSB(() => recurring = v),
+                    ),
+                    const SizedBox(width: 8),
+                    if (recurring) ...[
+                      SizedBox(
+                        width: 64,
+                        child: AppInputs.textField(
+                          controller: everyCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(labelText: 'Every'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      DropdownButton<String>(
+                        value: repeatUnit,
+                        onChanged: (v) =>
+                            setSB(() => repeatUnit = v ?? 'Monthly'),
+                        items: const [
+                          DropdownMenuItem(value: 'Daily', child: Text('days')),
+                          DropdownMenuItem(
+                            value: 'Weekly',
+                            child: Text('weeks'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Monthly',
+                            child: Text('months'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Yearly',
+                            child: Text('years'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ],
               const SizedBox(height: 12),
-
               FilledButton(
                 onPressed: () async {
-                  final n = nameCtrl.text.trim();
-                  final t =
-                      double.tryParse(targetCtrl.text.replaceAll(',', '')) ?? 0;
-                  final b =
-                      double.tryParse(balanceCtrl.text.replaceAll(',', '')) ??
-                      0;
-
-                  if (n.isEmpty || t <= 0) {
-                    Navigator.pop(ctx);
+                  final name = AppInputs.toTitleCase(nameCtrl.text.trim());
+                  if (name.isEmpty) {
+                    if (ctx.mounted) Navigator.pop(ctx);
                     return;
                   }
 
-                  final env = _Envelope(
-                    id: _newId(),
-                    ownerId: currentUid,
-                    name: n,
-                    target: t,
-                    balance: b,
-                    payDate: payDate,
-                    payRepeat: (payDate != null && recurring)
-                        ? repeatUnit
-                        : 'None',
-                    payEvery: (payDate != null && recurring)
-                        ? (int.tryParse(everyCtrl.text) ?? 1)
-                        : null,
-                    resetOnRecurring: (payDate != null && recurring)
-                        ? resetOnRecurring
-                        : false,
-                  );
+                  final amount = !isParent
+                      ? double.tryParse(amountCtrl.text.replaceAll(',', ''))
+                      : null;
+                  final every = int.tryParse(everyCtrl.text) ?? 1;
 
-                  final first = _envelopes.isEmpty;
-                  setState(() {
-                    _envelopes.add(env);
-                    _sortEnvelopes();
-                  });
-                  await _saveState();
-
-                  // Push to shared calendar if a pay date is set (date-only)
-                  if (env.payDate != null) {
-                    CalendarEvents.instance.upsert(
-                      CalEvent(
-                        id: 'env:${env.id}',
-                        title: 'Payment: ${env.name}',
-                        date: _ymd(env.payDate!),
-                        repeat: env.payRepeat ?? 'None',
-                        every: env.payEvery ?? 1,
-                        reminder: 'None',
-                        meta: {'envelopeId': env.id},
-                      ),
+                  if (existing == null) {
+                    final cat = BudgetCategory(
+                      id: _newId(),
+                      name: name,
+                      parentId: parentId,
+                      spent: isParent ? null : amount,
+                      startDate: isParent ? null : startDate,
+                      repeat: isParent
+                          ? 'None'
+                          : (startDate != null && recurring
+                                ? repeatUnit
+                                : 'None'),
+                      every: isParent
+                          ? 1
+                          : (startDate != null && recurring ? every : 1),
                     );
-                  }
+                    setState(() => _cats.add(cat));
+                    if (_wsId != null) {
+                      await _catsCol.doc(cat.id).set(cat.toJson());
+                    } else {
+                      await _saveBudgetPrefs();
+                    }
 
-                  if (mounted) Navigator.pop(ctx);
-                  if (first && mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          'Tip: use the + to add more envelopes or groups.',
+                    // Mirror to Calendar for children only
+                    if (cat.parentId != null &&
+                        cat.startDate != null &&
+                        cat.repeat != 'None') {
+                      CalendarEvents.instance.upsert(
+                        CalEvent(
+                          id: 'budgetcat:${cat.id}',
+                          title: 'Budget: ${cat.name}',
+                          date: _ymd(cat.startDate!),
+                          repeat: cat.repeat,
+                          every: cat.every,
+                          reminder: 'None',
+                          meta: {'budgetCategoryId': cat.id},
                         ),
-                      ),
-                    );
+                      );
+                    }
+                  } else {
+                    existing.name = name;
+                    if (!isParent) {
+                      existing.spent = amount;
+                      existing.startDate = startDate;
+                      existing.repeat = (startDate != null && recurring)
+                          ? repeatUnit
+                          : 'None';
+                      existing.every = (startDate != null && recurring)
+                          ? every
+                          : 1;
+                    } else {
+                      // parent: strip schedule just in case
+                      existing.spent = null;
+                      existing.startDate = null;
+                      existing.repeat = 'None';
+                      existing.every = 1;
+                    }
+
+                    setState(() {});
+                    await _saveBudgetPrefs();
+
+                    if (existing.parentId != null &&
+                        existing.startDate != null &&
+                        existing.repeat != 'None') {
+                      CalendarEvents.instance.upsert(
+                        CalEvent(
+                          id: 'budgetcat:${existing.id}',
+                          title: 'Budget: ${existing.name}',
+                          date: _ymd(existing.startDate!),
+                          repeat: existing.repeat,
+                          every: existing.every,
+                          reminder: 'None',
+                          meta: {'budgetCategoryId': existing.id},
+                        ),
+                      );
+                    } else {
+                      CalendarEvents.instance.remove(
+                        'budgetcat:${existing.id}',
+                      );
+                    }
                   }
+                  if (ctx.mounted) Navigator.pop(ctx);
                 },
-                child: const Text('Create'),
+                child: Text(existing == null ? 'Add' : 'Save'),
               ),
             ],
           ),
@@ -432,15 +637,485 @@ class _BudgetScreenState extends State<BudgetScreen> {
     );
   }
 
-  Future<void> _createGroup() async {
-    final ctrl = TextEditingController();
-    await showDialog<void>(
+  void _deleteCategory(BudgetCategory cat) async {
+    void rm(String id) {
+      final kids = _childrenOf(id);
+      for (final k in kids) {
+        rm(k.id);
+      }
+      _cats.removeWhere((c) => c.id == id);
+      _expanded.remove(id);
+      CalendarEvents.instance.remove('budgetcat:$id');
+    }
+
+    final dcount = _descendantCount(cat.id);
+    final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Create group'),
+        title: const Text('Delete category?'),
+        content: Text(
+          dcount == 0
+              ? 'Delete “${cat.name}”?'
+              : 'Delete “${cat.name}” and $dcount subcategor${dcount == 1 ? 'y' : 'ies'}?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok == true) {
+      setState(() => rm(cat.id));
+      final idsToDelete = _collectDescendantIds(cat.id);
+      await _saveBudgetPrefs();
+      await _deleteCatsByIds(idsToDelete);
+    }
+  }
+
+  // Bulk delete support
+  void _startBudgetDeleteMode() {
+    setState(() {
+      _budgetDeleteMode = true;
+      _budgetSelected.clear();
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Select items to delete. Use the red FAB to confirm, or back to cancel.',
+        ),
+      ),
+    );
+  }
+
+  void _cancelBudgetDeleteMode() {
+    setState(() {
+      _budgetDeleteMode = false;
+      _budgetSelected.clear();
+    });
+  }
+
+  int _descendantCount(String id) {
+    int count = 0;
+    final kids = _childrenOf(id);
+    for (final k in kids) {
+      count += 1 + _descendantCount(k.id);
+    }
+    return count;
+  }
+
+  Future<void> _confirmDeleteSelected() async {
+    if (_budgetSelected.isEmpty) {
+      _cancelBudgetDeleteMode();
+      return;
+    }
+
+    // build set: selected + all descendants
+    final toDelete = <String>{};
+    for (final id in _budgetSelected) {
+      void addAll(String x) {
+        toDelete.add(x);
+        for (final k in _childrenOf(x)) {
+          addAll(k.id);
+        }
+      }
+
+      addAll(id);
+    }
+
+    int parentsWithKids = 0;
+    int totalKids = 0;
+    for (final id in _budgetSelected) {
+      final c = _childrenOf(id);
+      if (c.isNotEmpty) {
+        parentsWithKids++;
+        totalKids += _descendantCount(id);
+      }
+    }
+
+    final msg = parentsWithKids == 0
+        ? 'Delete ${toDelete.length} item(s)?'
+        : 'Delete ${toDelete.length} item(s)?\n\n'
+              'Includes $parentsWithKids main categor${parentsWithKids == 1 ? 'y' : 'ies'} '
+              'with $totalKids subcategor${totalKids == 1 ? 'y' : 'ies'}.';
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete selected?'),
+        content: Text(msg),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok != true) return;
+
+    setState(() {
+      _cats.removeWhere((c) => toDelete.contains(c.id));
+      for (final id in toDelete) {
+        _expanded.remove(id);
+        CalendarEvents.instance.remove('budgetcat:$id');
+      }
+      _budgetDeleteMode = false;
+      _budgetSelected.clear();
+    });
+    await _saveBudgetPrefs();
+    await _deleteCatsByIds(toDelete);
+  }
+
+  // ===== UI bits =====
+
+  double _nameColWidth() {
+    // Longest root name, clamped to ~12 chars (two lines max visual width)
+    final roots = _roots();
+    if (roots.isEmpty) return 200;
+    int maxLen = roots
+        .map((e) => math.min(12, e.name.length))
+        .fold<int>(0, math.max);
+    // 16px per char-ish + padding + affordance room
+    final w = 16.0 * maxLen + 28.0 + 20.0;
+    return w.clamp(160.0, 260.0);
+  }
+
+  TextEditingController _ctrlFor(
+    Map<String, TextEditingController> bag,
+    String key,
+    String initial,
+  ) {
+    if (!bag.containsKey(key)) bag[key] = TextEditingController(text: initial);
+    return bag[key]!;
+  }
+
+  Widget _moneyFieldDense({
+    required TextEditingController controller,
+    required ValueChanged<double> onChanged,
+  }) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 36),
+      child: TextField(
+        controller: controller,
+        maxLines: 1,
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+        textAlign: TextAlign.left,
+        decoration: const InputDecoration(
+          isDense: true,
+          border: InputBorder.none,
+          contentPadding: EdgeInsets.zero,
+          prefixText: '£ ',
+        ),
+        onChanged: (s) =>
+            onChanged(double.tryParse(s.replaceAll(',', '')) ?? 0),
+      ),
+    );
+  }
+
+  Widget _budgetSummaryBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+      child: Wrap(
+        spacing: 18,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                onPressed: () => _shiftMonth(-1),
+                icon: const Icon(Icons.chevron_left),
+              ),
+              Text(
+                _monthLabel(_monthStart),
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              IconButton(
+                onPressed: () => _shiftMonth(1),
+                icon: const Icon(Icons.chevron_right),
+              ),
+            ],
+          ),
+          SizedBox(
+            width: 220,
+            child: AppInputs.textField(
+              controller: _incomeCtrl,
+              focusNode: _incomeFocus,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                prefixText: '£ ',
+                labelText: 'Monthly income',
+              ),
+              onChanged: (v) {
+                _incomeDebounce?.cancel();
+                _monthlyIncome = double.tryParse(v.replaceAll(',', '')) ?? 0.0;
+                _incomeDebounce = Timer(
+                  const Duration(milliseconds: 250),
+                  () async {
+                    await _saveIncome();
+                    if (mounted) setState(() {});
+                  },
+                );
+              },
+            ),
+          ),
+          _pill('Outgoings', _totalOutgoings),
+          _pill('Remaining', _remaining, isWarning: _remaining < 0),
+        ],
+      ),
+    );
+  }
+
+  Widget _pill(String label, double value, {bool isWarning = false}) {
+    final color = isWarning
+        ? Theme.of(context).colorScheme.errorContainer
+        : Theme.of(context).colorScheme.surfaceContainerHighest;
+    final txt = isWarning
+        ? Theme.of(context).colorScheme.onErrorContainer
+        : Theme.of(context).colorScheme.onSurface;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '$label: ',
+            style: TextStyle(fontWeight: FontWeight.w600, color: txt),
+          ),
+          Text(
+            '£${value.toStringAsFixed(2)}',
+            style: TextStyle(
+              fontFeatures: const [FontFeature.tabularFigures()],
+              color: txt,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _budgetHeaderRow() {
+    final nameW = _nameColWidth();
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: Row(
+        children: [
+          // Frozen Category header
+          SizedBox(
+            width: nameW,
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Category',
+                style: Theme.of(context).textTheme.labelLarge,
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+              ),
+            ),
+          ),
+
+          // Right header – scrolls with body (shared controller)
+          Expanded(
+            child: SingleChildScrollView(
+              controller: _budgetHoriz,
+              scrollDirection: Axis.horizontal,
+              physics: const NeverScrollableScrollPhysics(),
+              child: SizedBox(
+                width: _kTableWidth,
+                child: Row(
+                  children: const [
+                    SizedBox(
+                      width: _wAmount,
+                      child: Text(
+                        'Amount',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<_RowData> _buildBudgetRows() {
+    final rows = <_RowData>[];
+
+    void walk(BudgetCategory c, int depth) {
+      final kids = _childrenOf(c.id);
+      final isParent = _isRoot(c.id);
+      final showKids = _expanded[c.id] ?? true;
+
+      final spent = _sumSpent(c.id);
+
+      rows.add(
+        _RowData(cat: c, depth: depth, isParent: isParent, amount: spent),
+      );
+
+      if (isParent && showKids) {
+        for (final k in kids) {
+          walk(k, depth + 1);
+        }
+      }
+    }
+
+    for (final r in _roots()) {
+      walk(r, 0);
+    }
+    return rows;
+  }
+
+  Widget _budgetLeftColumn(List<_RowData> rows) {
+    final nameW = _nameColWidth();
+    return SizedBox(
+      width: nameW,
+      child: ListView.builder(
+        controller: _budgetNamesVert,
+        itemCount: rows.length,
+        itemBuilder: (ctx, i) {
+          final r = rows[i];
+
+          // NEW: treat “parent-ness” visually by root status, not by having kids.
+          final isRoot = _isRoot(r.cat.id);
+          final expanded = _expanded[r.cat.id] ?? true;
+          final indent = r.depth * 16.0;
+          final hasKids = _childrenOf(r.cat.id).isNotEmpty;
+
+          return InkWell(
+            onLongPress: () => _onLongPressCategory(r.cat, isRoot),
+            child: Container(
+              height: 48,
+              padding: EdgeInsets.only(left: 12 + indent, right: 8),
+              alignment: Alignment.centerLeft,
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(
+                    color: Theme.of(ctx).dividerColor.withOpacity(0.5),
+                  ),
+                ),
+              ),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 24,
+                    child: hasKids && !_budgetDeleteMode
+                        ? IconButton(
+                            padding: EdgeInsets.zero,
+                            icon: Icon(
+                              expanded ? Icons.expand_less : Icons.expand_more,
+                            ),
+                            onPressed: () =>
+                                setState(() => _expanded[r.cat.id] = !expanded),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                  Expanded(
+                    child: Text(
+                      r.cat.name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      softWrap: true,
+                      style: TextStyle(
+                        fontWeight: isRoot ? FontWeight.w700 : FontWeight.w400,
+                        fontSize: isRoot ? 16 : 14,
+                      ),
+                    ),
+                  ),
+                  // Always allow adding a subcategory to a ROOT, even if it has none yet.
+                  if (isRoot && !_budgetDeleteMode)
+                    IconButton(
+                      tooltip: 'Add subcategory',
+                      icon: const Icon(Icons.add),
+                      onPressed: () => _addSubCategory(r.cat.id),
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _onLongPressCategory(BudgetCategory c, bool isRoot) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Wrap(
+          children: [
+            if (!isRoot)
+              ListTile(
+                leading: const Icon(Icons.tune_outlined),
+                title: const Text('Edit (amount/recurring)'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _editCategory(existing: c);
+                },
+              ),
+            ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('Rename'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _renameCategory(c);
+              },
+            ),
+            if (isRoot)
+              ListTile(
+                leading: const Icon(Icons.add),
+                title: const Text('Add subcategory'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _addSubCategory(c.id);
+                },
+              ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Colors.red),
+              title: const Text('Delete'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _deleteCategory(c);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _renameCategory(BudgetCategory c) {
+    final ctrl = TextEditingController(text: c.name);
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Rename'),
         content: AppInputs.textField(
           controller: ctrl,
-          decoration: const InputDecoration(labelText: 'Group name'),
+          decoration: const InputDecoration(labelText: 'Name'),
         ),
         actions: [
           TextButton(
@@ -449,18 +1124,14 @@ class _BudgetScreenState extends State<BudgetScreen> {
           ),
           FilledButton(
             onPressed: () async {
-              final name = ctrl.text.trim();
-              if (name.isEmpty) {
+              final v = ctrl.text.trim();
+              if (v.isEmpty) {
                 Navigator.pop(ctx);
                 return;
               }
-              setState(
-                () => _groups.add(
-                  _Group(id: _newId(), name: name, memberIds: {}),
-                ),
-              );
-              await _saveState();
-              if (mounted) Navigator.pop(ctx);
+              setState(() => c.name = AppInputs.toTitleCase(v));
+              await _saveBudgetPrefs();
+              Navigator.pop(ctx);
             },
             child: const Text('Save'),
           ),
@@ -469,761 +1140,232 @@ class _BudgetScreenState extends State<BudgetScreen> {
     );
   }
 
-  void _onLongPressEnvelope(_Envelope env, bool isOwner) {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.add),
-              title: const Text('Deposit'),
-              enabled: isOwner,
-              onTap: !isOwner
-                  ? null
-                  : () {
-                      Navigator.pop(ctx);
-                      _editAmount(
-                        title: 'Deposit to ${env.name}',
-                        onConfirm: (amt) async {
-                          setState(() => env.balance += amt);
-                          await _saveState();
-                        },
-                      );
-                    },
-            ),
-            ListTile(
-              leading: const Icon(Icons.remove),
-              title: const Text('Withdraw'),
-              enabled: isOwner,
-              onTap: !isOwner
-                  ? null
-                  : () {
-                      Navigator.pop(ctx);
-                      _editAmount(
-                        title: 'Withdraw from ${env.name}',
-                        onConfirm: (amt) async {
-                          setState(
-                            () => env.balance = (env.balance - amt).clamp(
-                              0,
-                              double.infinity,
-                            ),
-                          );
-                          await _saveState();
-                        },
-                      );
-                    },
-            ),
-            ListTile(
-              leading: const Icon(Icons.swap_horiz),
-              title: const Text('Transfer'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _transferFrom(env);
-              },
-            ),
-            const Divider(height: 8),
-            ListTile(
-              leading: const Icon(Icons.flag_outlined),
-              title: const Text('Edit Target'),
-              enabled: isOwner,
-              onTap: !isOwner
-                  ? null
-                  : () {
-                      Navigator.pop(ctx);
-                      _editAmount(
-                        title: 'New target for ${env.name}',
-                        initial: env.target,
-                        onConfirm: (amt) async {
-                          setState(
-                            () => env.target = (amt <= 0 ? env.target : amt),
-                          );
-                          await _saveState();
-                        },
-                      );
-                    },
-            ),
-            ListTile(
-              leading: const Icon(Icons.edit),
-              title: const Text('Rename'),
-              enabled: isOwner,
-              onTap: !isOwner
-                  ? null
-                  : () {
-                      Navigator.pop(ctx);
-                      _editText(
-                        title: 'Rename envelope',
-                        initial: env.name,
-                        onConfirm: (txt) async {
-                          setState(() {
-                            env.name = txt;
-                            _sortEnvelopes();
-                          });
-                          await _saveState();
-                          // also update calendar event title if exists
-                          if (env.payDate != null) {
-                            CalendarEvents.instance.upsert(
-                              CalEvent(
-                                id: 'env:${env.id}',
-                                title: 'Payment: ${env.name}',
-                                date: _ymd(env.payDate!),
-                                repeat: env.payRepeat ?? 'None',
-                                every: env.payEvery ?? 1,
-                                reminder: 'None',
-                                meta: {'envelopeId': env.id},
-                              ),
-                            );
-                          }
-                        },
-                      );
-                    },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline, color: Colors.red),
-              title: const Text('Delete'),
-              enabled: isOwner,
-              onTap: !isOwner
-                  ? null
-                  : () {
-                      Navigator.pop(ctx);
-                      _confirmDelete(env);
-                    },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget _budgetRightTable(List<_RowData> rows) {
+    return SingleChildScrollView(
+      controller: _budgetHoriz,
+      primary: false,
+      scrollDirection: Axis.horizontal,
+      child: SizedBox(
+        width: _kTableWidth,
+        child: ListView.builder(
+          controller: _budgetVert,
+          itemCount: rows.length,
+          itemBuilder: (ctx, i) {
+            final r = rows[i];
+            final isParent = r.isParent;
 
-  void _onLongPressGroup(_Group group) {
-    final selected = {...group.memberIds};
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
-          top: 16,
-        ),
-        child: StatefulBuilder(
-          builder: (ctx, setSB) => Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                'Edit group members',
-                style: Theme.of(ctx).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 12),
-              SizedBox(
-                height: 320,
-                child: ListView(
-                  children: _envelopes.map((e) {
-                    final checked = selected.contains(e.id);
-                    return CheckboxListTile(
-                      title: Text(e.name),
-                      value: checked,
-                      onChanged: (v) => setSB(() {
-                        if (v == true) {
-                          selected.add(e.id);
-                        } else {
-                          selected.remove(e.id);
-                        }
-                      }),
-                    );
-                  }).toList(),
+            return Container(
+              height: 48,
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(
+                    color: Theme.of(ctx).dividerColor.withOpacity(0.5),
+                  ),
                 ),
               ),
-              const SizedBox(height: 8),
-              Row(
+              child: Row(
                 children: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    child: const Text('Cancel'),
-                  ),
-                  const Spacer(),
-                  FilledButton(
-                    onPressed: () async {
-                      setState(() => group.memberIds = selected);
-                      await _saveState();
-                      if (mounted) Navigator.pop(ctx);
-                    },
-                    child: const Text('Save'),
+                  // Amount (leaf editable; parent shows aggregate)
+                  SizedBox(
+                    width: _wAmount,
+                    child: isParent
+                        ? Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              '£${r.amount.toStringAsFixed(2)}',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          )
+                        : _moneyFieldDense(
+                            controller: _ctrlFor(
+                              _amountCtrls,
+                              r.cat.id,
+                              r.amount == 0 ? '' : r.amount.toStringAsFixed(2),
+                            ),
+                            onChanged: (v) async {
+                              r.cat.spent = v;
+                              setState(() {});
+                              if (_useFirestore) {
+                                await _upsertCat(r.cat);
+                              } else {
+                                await _saveBudgetPrefs();
+                              }
+                            },
+                          ),
                   ),
                 ],
               ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBudgetPage() {
+    final rows = _buildBudgetRows();
+    final nameW = _nameColWidth();
+
+    return Column(
+      children: [
+        _budgetSummaryBar(),
+        _budgetHeaderRow(),
+        Expanded(
+          child: Row(
+            children: [
+              SizedBox(width: nameW, child: _budgetLeftColumn(rows)),
+              Expanded(child: _budgetRightTable(rows)),
             ],
           ),
         ),
-      ),
-    );
-  }
-
-  void _editAmount({
-    required String title,
-    double? initial,
-    required void Function(double amount) onConfirm,
-  }) {
-    final ctrl = TextEditingController(
-      text: initial == null ? '' : initial.toStringAsFixed(2),
-    );
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
-          top: 16,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(title, style: Theme.of(ctx).textTheme.titleMedium),
-            const SizedBox(height: 12),
-            AppInputs.textField(
-              controller: ctrl,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
-              decoration: const InputDecoration(
-                prefixText: '£ ',
-                labelText: 'Amount',
-              ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton(
-              onPressed: () {
-                final v = double.tryParse(ctrl.text.replaceAll(',', ''));
-                if (v == null || v.isNaN || v.isInfinite || v <= 0) {
-                  Navigator.pop(ctx);
-                  return;
-                }
-                onConfirm(v);
-                Navigator.pop(ctx);
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _editText({
-    required String title,
-    String initial = '',
-    required void Function(String text) onConfirm,
-  }) {
-    final ctrl = TextEditingController(text: initial);
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
-          top: 16,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(title, style: Theme.of(ctx).textTheme.titleMedium),
-            const SizedBox(height: 12),
-            AppInputs.textField(
-              controller: ctrl,
-              decoration: const InputDecoration(labelText: 'Name'),
-            ),
-            const SizedBox(height: 12),
-            FilledButton(
-              onPressed: () {
-                final txt = ctrl.text.trim();
-                if (txt.isEmpty) {
-                  Navigator.pop(ctx);
-                  return;
-                }
-                onConfirm(txt);
-                Navigator.pop(ctx);
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _confirmDelete(_Envelope env) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete envelope?'),
-        content: Text('This removes “${env.name}”. You can’t undo this.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () async {
-              setState(() {
-                _envelopes.remove(env);
-                for (final g in _groups) {
-                  g.memberIds.remove(env.id);
-                }
-              });
-              await _saveState();
-              CalendarEvents.instance.remove('env:${env.id}');
-              if (mounted) Navigator.pop(ctx);
-            },
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _transferFrom(_Envelope source) {
-    EnvelopeDropdownResult? target;
-    final amountCtrl = TextEditingController();
-
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) {
-        final items = _envelopes.where((e) => e != source).map((e) {
-          final isMine = e.ownerId == FirebaseAuth.instance.currentUser?.uid;
-          return DropdownMenuItem<EnvelopeDropdownResult>(
-            value: EnvelopeDropdownResult(env: e, isMine: isMine),
-            child: Text('${e.name}${isMine ? '' : ' (partner)'}'),
-          );
-        }).toList();
-
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 16,
-            right: 16,
-            bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
-            top: 16,
-          ),
-          child: StatefulBuilder(
-            builder: (ctx, setSB) => Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  'Transfer from ${source.name}',
-                  style: Theme.of(ctx).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<EnvelopeDropdownResult>(
-                  items: items,
-                  initialValue: target, // fix deprecation
-                  onChanged: (v) => setSB(() => target = v),
-                  decoration: const InputDecoration(
-                    labelText: 'Target envelope',
-                  ),
-                ),
-                const SizedBox(height: 12),
-                AppInputs.textField(
-                  controller: amountCtrl,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                  ),
-                  decoration: const InputDecoration(
-                    prefixText: '£ ',
-                    labelText: 'Amount',
-                  ),
-                ),
-                const SizedBox(height: 12),
-                FilledButton(
-                  onPressed: () async {
-                    final amt =
-                        double.tryParse(amountCtrl.text.replaceAll(',', '')) ??
-                        0;
-                    if (target == null || amt <= 0) {
-                      Navigator.pop(ctx);
-                      return;
-                    }
-                    setState(() {
-                      source.balance = (source.balance - amt).clamp(
-                        0,
-                        double.infinity,
-                      );
-                      target!.env.balance += amt;
-                    });
-                    await _saveState();
-                    if (mounted) Navigator.pop(ctx);
-                  },
-                  child: const Text('Transfer'),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  // ==== UI pieces (RESTORED) ================================================
-
-  Widget _buildEnvelopeGrid(List<_Envelope> sorted, String? currentUid) {
-    return GridView.builder(
-      controller: _scrollController,
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
-        mainAxisSpacing: 12,
-        crossAxisSpacing: 12,
-        childAspectRatio: 1.05,
-      ),
-      itemCount: sorted.length,
-      itemBuilder: (context, i) {
-        final e = sorted[i];
-        final isOwner = e.ownerId == currentUid;
-        final progress = e.target <= 0
-            ? 0.0
-            : (e.balance / e.target).clamp(0, 1).toDouble();
-
-        return GestureDetector(
-          onLongPress: () => _onLongPressEnvelope(e, isOwner),
-          child: Opacity(
-            opacity: isOwner ? 1 : 0.55,
-            child: IgnorePointer(
-              ignoring: !isOwner,
-              child: Card(
-                clipBehavior: Clip.antiAlias,
-                child: InkWell(
-                  onTap: () {}, // placeholder for envelope details
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          e.name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        const SizedBox(height: 10),
-                        LinearProgressIndicator(value: progress),
-                        const SizedBox(height: 10),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: const [Text('Current'), Text('Target')],
-                        ),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Text(
-                              '£${e.balance.toStringAsFixed(2)}',
-                              style: Theme.of(context).textTheme.titleMedium,
-                            ),
-                            Text(
-                              '£${e.target.toStringAsFixed(0)}',
-                              style: Theme.of(context).textTheme.titleMedium,
-                            ),
-                          ],
-                        ),
-                        const Spacer(),
-                        if (!isOwner)
-                          Text(
-                            'Partner',
-                            style: Theme.of(context).textTheme.labelSmall,
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildGroupsList(String? currentUid) {
-    return ListView.separated(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
-      itemCount: _groups.length,
-      separatorBuilder: (_, __) => const SizedBox(height: 12),
-      itemBuilder: (ctx, i) {
-        final g = _groups[i];
-        final members = _envelopes
-            .where((e) => g.memberIds.contains(e.id))
-            .toList();
-        final total = members.fold<double>(0, (sum, e) => sum + e.balance);
-
-        return GestureDetector(
-          onLongPress: () => _onLongPressGroup(g),
-          child: Card(
-            clipBehavior: Clip.antiAlias,
-            child: InkWell(
-              onTap: () {
-                // Open group detail list
-                Navigator.push(
-                  ctx,
-                  MaterialPageRoute(
-                    builder: (_) =>
-                        _GroupDetailScreen(group: g, members: members),
-                  ),
-                );
-              },
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: SizedBox(
-                  height: 160, // “bigger than normal”, about 2 tiles tall
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(g.name, style: Theme.of(ctx).textTheme.titleLarge),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Total in group',
-                        style: Theme.of(ctx).textTheme.labelMedium,
-                      ),
-                      Text(
-                        '£${total.toStringAsFixed(2)}',
-                        style: Theme.of(ctx).textTheme.headlineSmall,
-                      ),
-                      const Spacer(),
-                      Text(
-                        '${members.length} envelope(s)',
-                        style: Theme.of(ctx).textTheme.labelSmall,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildAzOverlay(List<_Envelope> sorted) {
-    // Hidden entirely in group view
-    if (_groupView) return const SizedBox.shrink();
-
-    // Each letter gets a fixed height → consistent hit area
-    const double itemHeight = 18.0; // tweak if you want larger/smaller
-    final double barHeight = itemHeight * _letters.length;
-
-    void selectByDy(double dy) {
-      final idx = (dy ~/ itemHeight).clamp(0, _letters.length - 1);
-      final letter = _letters[idx];
-      if (_activeLetter != letter) {
-        setState(() => _activeLetter = letter);
-        _jumpToLetter(letter, sorted);
-      }
-    }
-
-    return Stack(
-      children: [
-        Positioned(
-          right: 0,
-          top: 0,
-          bottom: 0,
-          child: Center(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onTapDown: (d) {
-                _showIndex();
-                selectByDy(d.localPosition.dy);
-                _scheduleHideIndex();
-              },
-              onVerticalDragStart: (_) => _showIndex(),
-              onVerticalDragUpdate: (d) => selectByDy(d.localPosition.dy),
-              onVerticalDragEnd: (_) => _scheduleHideIndex(),
-              child: AnimatedOpacity(
-                duration: const Duration(milliseconds: 120),
-                opacity: _indexVisible ? 1 : 0.15,
-                child: SizedBox(
-                  width: 28,
-                  height: barHeight,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.surfaceVariant.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: _letters.map((ch) {
-                        final active = _activeLetter == ch;
-                        return SizedBox(
-                          height: itemHeight,
-                          child: Center(
-                            child: Text(
-                              ch,
-                              style: TextStyle(
-                                fontSize: active ? 12 : 10,
-                                fontWeight: active
-                                    ? FontWeight.bold
-                                    : FontWeight.w400,
-                              ),
-                            ),
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-
-        // Floating bubble with current letter
-        if (_indexVisible && _activeLetter != null)
-          Center(
-            child: Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface.withOpacity(0.95),
-                shape: BoxShape.circle,
-                boxShadow: kElevationToShadow[3],
-              ),
-              child: Text(
-                _activeLetter!,
-                style: Theme.of(context).textTheme.headlineMedium,
-              ),
-            ),
-          ),
-
-        // Top header letter (like Contacts)
-        if (_indexVisible && _activeLetter != null)
-          Positioned(
-            top: 8,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.surfaceVariant.withOpacity(0.8),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  _activeLetter!,
-                  style: Theme.of(context).textTheme.titleSmall,
-                ),
-              ),
-            ),
-          ),
       ],
     );
   }
 
-  // ==== build ================================================================
+  // ===== CSV export (still works; Amount-only now) =====
+  Future<void> _exportCsv({required bool shareAfter}) async {
+    final buffer = StringBuffer();
+    buffer.writeln('Month,Category,Amount');
+    for (final r in _buildBudgetRows()) {
+      buffer.writeln(
+        '${_monthLabel(_monthStart)},'
+        '"${r.cat.name.replaceAll('"', '""')}",'
+        '${r.amount.toStringAsFixed(2)}',
+      );
+    }
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File(
+      '${dir.path}/budget_${_monthStart.year}_${_monthStart.month.toString().padLeft(2, '0')}.csv',
+    );
+    await file.writeAsString(buffer.toString());
+    if (shareAfter) {
+      await Share.shareXFiles([XFile(file.path)], text: 'Budget export');
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Exported: ${file.path}')));
+      }
+    }
+  }
+
+  // ===== Build =====
+  bool _budgetDeleteMode = false;
+  final Set<String> _budgetSelected = <String>{};
 
   @override
   Widget build(BuildContext context) {
-    final currentUid = FirebaseAuth.instance.currentUser?.uid;
-
-    final sorted = [..._envelopes]
-      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-
-    final hasData = _groupView ? _groups.isNotEmpty : sorted.isNotEmpty;
-
-    final emptyState = Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.account_balance_wallet_outlined, size: 48),
-          const SizedBox(height: 12),
-          Text(_groupView ? 'No groups yet' : 'No envelopes yet'),
-          const SizedBox(height: 8),
-          if (!_groupView)
-            FilledButton.icon(
-              onPressed: _createEnvelope,
-              icon: const Icon(Icons.add),
-              label: const Text('Create your first envelope'),
-            )
-          else
-            FilledButton.icon(
-              onPressed: _createGroup,
-              icon: const Icon(Icons.create_new_folder_outlined),
-              label: const Text('Create your first group'),
-            ),
-        ],
-      ),
-    );
-
     return Scaffold(
-      appBar: AppBar(title: const Text('Budget')),
+      appBar: AppBar(
+        title: const Text('Budget'),
+        actions: [WorkspaceInviteAction()],
+      ),
       drawer: const SideNavDrawer(),
-      body: Stack(
+      body: PageView(
+        controller: _page,
+        onPageChanged: (i) => setState(() => _tab = i),
         children: [
-          if (!hasData)
-            emptyState
-          else
-            (_groupView
-                ? _buildGroupsList(currentUid)
-                : _buildEnvelopeGrid(sorted, currentUid)),
-          _buildAzOverlay(sorted),
+          LedgerScreen(
+            monthStart: _monthStart,
+            monthlyIncome: _monthlyIncome,
+            rows: _buildBudgetRows(),
+          ),
+          _buildBudgetPage(),
+          EnvelopeGroupsScreen(key: _egKey1, activeChildTab: 1), // tab index 2
+          EnvelopeGroupsScreen(key: _egKey2, activeChildTab: 2), // tab index 3
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () => _openFabSheet(),
-        child: const Icon(Icons.add),
-      ),
+
+      // FAB per tab
+      floatingActionButton: _tab == 1
+          ? (_budgetDeleteMode
+                ? FloatingActionButton.extended(
+                    onPressed: _confirmDeleteSelected,
+                    backgroundColor: Colors.red,
+                    icon: const Icon(Icons.delete),
+                    label: Text(
+                      _budgetSelected.isEmpty
+                          ? 'Delete selected'
+                          : 'Delete (${_budgetSelected.length})',
+                    ),
+                  )
+                : FloatingActionButton(
+                    onPressed: _openBudgetFabSheet,
+                    child: const Icon(Icons.add),
+                  ))
+          : (_tab == 2
+                ? _egKey1.currentState?.buildFab()
+                : _tab == 3
+                ? _egKey2.currentState?.buildFab()
+                : null),
+
       bottomNavigationBar: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-          child: ToggleButtons(
-            isSelected: [!_groupView, _groupView],
-            onPressed: (i) => setState(() => _groupView = (i == 1)),
-            children: const [
-              Padding(
-                padding: EdgeInsets.symmetric(horizontal: 10),
-                child: Text('Single'),
-              ),
-              Padding(
-                padding: EdgeInsets.symmetric(horizontal: 10),
-                child: Text('Group'),
-              ),
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+          child: SegmentedButton<int>(
+            showSelectedIcon: false, // no checkmark overlay
+            segments: const [
+              ButtonSegment(value: 0, icon: Icon(Icons.receipt_long)),
+              ButtonSegment(value: 1, icon: Icon(Icons.calculate_outlined)),
+              ButtonSegment(value: 2, icon: Icon(Icons.mail_outline)),
+              ButtonSegment(value: 3, icon: Icon(Icons.dashboard_outlined)),
             ],
+            selected: {_tab},
+            onSelectionChanged: (s) {
+              final i = s.first;
+              setState(() => _tab = i);
+              _page.animateToPage(
+                i,
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+              );
+            },
           ),
         ),
       ),
     );
   }
 
-  // ==== helper & models ======================================================
-
-  String _newId() => DateTime.now().microsecondsSinceEpoch.toString();
-
-  void _openFabSheet() {
+  // FAB options (Budget)
+  void _openBudgetFabSheet() {
     showModalBottomSheet<void>(
       context: context,
       builder: (ctx) => SafeArea(
         child: Wrap(
           children: [
-            if (!_groupView)
-              ListTile(
-                leading: const Icon(Icons.add_box_outlined),
-                title: const Text('Create new envelope'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _createEnvelope();
-                },
-              ),
             ListTile(
               leading: const Icon(Icons.create_new_folder_outlined),
-              title: const Text('Create group'),
+              title: const Text('Add main budget category'),
               onTap: () {
                 Navigator.pop(ctx);
-                _createGroup();
+                _addRootCategory();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Delete items'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _startBudgetDeleteMode();
+              },
+            ),
+            const Divider(height: 8),
+            ListTile(
+              leading: const Icon(Icons.file_download),
+              title: const Text('Export CSV (file only)'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _exportCsv(shareAfter: false);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.share),
+              title: const Text('Export & send CSV'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _exportCsv(shareAfter: true);
               },
             ),
           ],
@@ -1233,138 +1375,142 @@ class _BudgetScreenState extends State<BudgetScreen> {
   }
 }
 
-// ===== Models (now include pay date + recurrence + reset) ====================
-
-class _Envelope {
-  _Envelope({
+// ===== Models =====
+class BudgetCategory {
+  BudgetCategory({
     required this.id,
-    required this.ownerId,
     required this.name,
-    required this.target,
-    required this.balance,
-    this.groupId, // legacy
-    this.payDate, // optional scheduled payment
-    this.payRepeat = 'None', // None/Daily/Weekly/Monthly/Yearly
-    this.payEvery, // repeat every N units
-    this.resetOnRecurring = false, // NEW
-    this.lastResetYmd, // NEW: 'yyyy-MM-dd' of last auto reset
+    this.parentId,
+    this.spent,
+    this.startDate,
+    this.repeat = 'None',
+    this.every = 1,
   });
 
   final String id;
-  final String ownerId;
   String name;
-  double target;
-  double balance;
-  final String? groupId;
+  String? parentId;
+  double? spent;
 
-  DateTime? payDate;
-  String? payRepeat;
-  int? payEvery;
-
-  bool resetOnRecurring;
-  String? lastResetYmd;
+  DateTime? startDate;
+  String repeat; // None/Daily/Weekly/Monthly/Yearly
+  int every; // repeat every N units
 
   Map<String, dynamic> toJson() => {
     'id': id,
-    'ownerId': ownerId,
     'name': name,
-    'target': target,
-    'balance': balance,
-    'groupId': groupId,
-    'payDate': payDate == null
-        ? null
-        : DateTime(
-            payDate!.year,
-            payDate!.month,
-            payDate!.day,
-          ).toIso8601String(), // date-only
-    'payRepeat': payRepeat,
-    'payEvery': payEvery,
-    'resetOnRecurring': resetOnRecurring,
-    'lastResetYmd': lastResetYmd,
+    'parentId': parentId,
+    'spent': spent,
+    'startDate': startDate?.toIso8601String(),
+    'repeat': repeat,
+    'every': every,
   };
 
-  factory _Envelope.fromJson(Map<String, dynamic> m) => _Envelope(
+  factory BudgetCategory.fromJson(Map<String, dynamic> m) => BudgetCategory(
     id: m['id'] as String,
-    ownerId: m['ownerId'] as String? ?? 'me',
     name: m['name'] as String? ?? '',
-    target: (m['target'] as num?)?.toDouble() ?? 0,
-    balance: (m['balance'] as num?)?.toDouble() ?? 0,
-    groupId: m['groupId'] as String?,
-    payDate: (m['payDate'] as String?) != null
-        ? DateTime.tryParse(m['payDate'] as String)
+    parentId: m['parentId'] as String?,
+    spent: (m['spent'] as num?)?.toDouble(),
+    startDate: (m['startDate'] as String?) != null
+        ? DateTime.tryParse(m['startDate'] as String)
         : null,
-    payRepeat: m['payRepeat'] as String? ?? 'None',
-    payEvery: (m['payEvery'] as num?)?.toInt(),
-    resetOnRecurring: (m['resetOnRecurring'] as bool?) ?? false,
-    lastResetYmd: m['lastResetYmd'] as String?,
+    repeat: m['repeat'] as String? ?? 'None',
+    every: (m['every'] as num?)?.toInt() ?? 1,
   );
 }
 
-class _Group {
-  _Group({required this.id, required this.name, required this.memberIds});
+// Internal row model for rendering
+class _RowData {
+  _RowData({
+    required this.cat,
+    required this.depth,
+    required this.isParent,
+    required this.amount,
+  });
 
-  final String id;
-  String name;
-  Set<String> memberIds;
-
-  Map<String, dynamic> toJson() => {
-    'id': id,
-    'name': name,
-    'memberIds': memberIds.toList(),
-  };
-
-  factory _Group.fromJson(Map<String, dynamic> m) => _Group(
-    id: m['id'] as String,
-    name: m['name'] as String? ?? '',
-    memberIds: {...((m['memberIds'] as List<dynamic>? ?? []).cast<String>())},
-  );
+  final BudgetCategory cat;
+  final int depth;
+  final bool isParent;
+  final double amount;
 }
 
-class EnvelopeDropdownResult {
-  EnvelopeDropdownResult({required this.env, required this.isMine});
-  final _Envelope env;
-  final bool isMine;
-}
-
-// ===== (optional) Group detail page =========================================
-
-class _GroupDetailScreen extends StatelessWidget {
-  const _GroupDetailScreen({required this.group, required this.members});
-  final _Group group;
-  final List<_Envelope> members;
+class WorkspaceInviteAction extends StatelessWidget {
+  const WorkspaceInviteAction({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final total = members.fold<double>(0, (s, e) => s + e.balance);
-    return Scaffold(
-      appBar: AppBar(title: Text(group.name)),
-      body: ListView.separated(
-        padding: const EdgeInsets.all(16),
-        itemCount: members.length + 1,
-        separatorBuilder: (_, __) => const SizedBox(height: 8),
-        itemBuilder: (ctx, i) {
-          if (i == 0) {
-            return Card(
-              child: ListTile(
-                title: const Text('Total'),
-                trailing: Text(
-                  '£${total.toStringAsFixed(2)}',
-                  style: Theme.of(ctx).textTheme.titleLarge,
-                ),
+    final session = WorkspaceSession.of(context);
+    final wsId = session.workspaceId;
+
+    // No workspace → nothing to show.
+    if (wsId == null) return const SizedBox.shrink();
+
+    return StreamBuilder<WorkspaceLite?>(
+      stream: WorkspaceService.instance.watchWorkspace(wsId),
+      builder: (context, snap) {
+        final ws = snap.data;
+        if (ws == null) {
+          return const SizedBox.shrink();
+        }
+
+        // Normalize nullable joinCode to a non-null String
+        final join = ws.joinCode ?? '';
+
+        return PopupMenuButton<String>(
+          tooltip: 'Workspace',
+          onSelected: (value) async {
+            if (value == 'copy') {
+              await Clipboard.setData(ClipboardData(text: join));
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Join code copied')),
+                );
+              }
+            } else if (value == 'share') {
+              await Share.share('Join my Team Love workspace: $join');
+            }
+          },
+          itemBuilder: (ctx) => [
+            PopupMenuItem<String>(
+              enabled: false,
+              child: Text(
+                ws.name,
+                style: const TextStyle(fontWeight: FontWeight.w600),
               ),
-            );
-          }
-          final e = members[i - 1];
-          return Card(
-            child: ListTile(
-              title: Text(e.name),
-              subtitle: Text('Target £${e.target.toStringAsFixed(0)}'),
-              trailing: Text('£${e.balance.toStringAsFixed(2)}'),
             ),
-          );
-        },
-      ),
+            const PopupMenuDivider(),
+            PopupMenuItem<String>(
+              value: 'copy',
+              child: Row(
+                children: [
+                  const Icon(Icons.copy, size: 18),
+                  const SizedBox(width: 8),
+                  Text('Copy join code (${join.isEmpty ? 'none' : join})'),
+                ],
+              ),
+            ),
+            PopupMenuItem<String>(
+              value: 'share',
+              child: Row(
+                children: const [
+                  Icon(Icons.ios_share, size: 18),
+                  SizedBox(width: 8),
+                  Text('Share join code'),
+                ],
+              ),
+            ),
+          ],
+          child: Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: Chip(
+              avatar: const Icon(Icons.groups_outlined, size: 18),
+              label: Text(ws.name, overflow: TextOverflow.ellipsis),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        );
+      },
     );
   }
 }

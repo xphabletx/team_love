@@ -174,12 +174,16 @@ class MealsStore {
     end = _d(end);
 
     final today = _d(DateTime.now());
-    if (start.isBefore(today))
+    if (start.isBefore(today)) {
       throw ArgumentError('Start date cannot be in the past.');
-    if (end.isBefore(start))
+    }
+    if (end.isBefore(start)) {
       throw ArgumentError('End date must be after start date.');
+    }
     final length = end.difference(start).inDays + 1;
-    if (length > 31) throw ArgumentError('Plan cannot exceed 31 days.');
+    if (length > 31) {
+      throw ArgumentError('Plan cannot exceed 31 days.');
+    }
 
     if (wipeOld) {
       _byDate.clear();
@@ -349,8 +353,7 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
           'type': 'meal',
           'mealType': isLunch ? 'lunch' : 'dinner',
           'date': _dateKey(widget.date),
-          'allDay':
-              true, // <— calendar UI can use this to suppress 00:00:00.000
+          'allDay': true, // calendar UI can use this to suppress 00:00:00.000
         },
       ),
     );
@@ -365,6 +368,7 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
   // Add / Edit bottom sheet (no suggestions; keeps Meal/Ingredients switch)
   Future<void> _addMeal({required bool isLunch}) async {
     await MealsStore.instance.ensureLoaded();
+    if (!mounted) return; // guard context use after await
 
     // Workspace gate (hidden for now)
     const bool hasWorkspace = false;
@@ -406,7 +410,7 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                   children: [
                     Text(
                       isLunch ? 'Add Lunch' : 'Add Dinner',
-                      style: Theme.of(context).textTheme.titleMedium,
+                      style: Theme.of(ctx).textTheme.titleMedium,
                     ),
                     const Spacer(),
                     SegmentedButton<bool>(
@@ -447,9 +451,7 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                     width: double.infinity,
                     padding: const EdgeInsets.all(8),
                     decoration: BoxDecoration(
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.surfaceContainerHighest,
+                      color: Theme.of(ctx).colorScheme.surfaceContainerHighest,
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
@@ -602,13 +604,11 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                       if (mealItems.isNotEmpty) {
                         final list = isLunch ? _day.lunch : _day.dinner;
                         final match = list.firstWhere(
-                          (e) =>
-                              e.userName == 'you' &&
-                              e.sharedDinner == (!isLunch && false),
+                          (e) => e.userName == 'you',
                           orElse: () => MealEntry(
                             userName: 'you',
                             items: [],
-                            sharedDinner: !isLunch && false,
+                            sharedDinner: false,
                           ),
                         );
                         if (!list.contains(match)) list.add(match);
@@ -689,7 +689,7 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
               children: [
                 Text(
                   'Add ingredients to shopping list',
-                  style: Theme.of(context).textTheme.titleMedium,
+                  style: Theme.of(ctx).textTheme.titleMedium,
                 ),
                 const SizedBox(height: 8),
                 AppInputs.textField(
