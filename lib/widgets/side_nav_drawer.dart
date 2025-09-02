@@ -10,6 +10,8 @@ import '../screens/shopping_screen.dart';
 import '../screens/workspace_setup_screen.dart';
 import '../screens/account_screen.dart';
 import '../screens/help_screen.dart';
+// 👇 NEW
+import '../screens/recipes_list_screen.dart';
 
 class SideNavDrawer extends StatelessWidget {
   const SideNavDrawer({super.key});
@@ -44,7 +46,6 @@ class _HeaderAndList extends StatelessWidget {
   const _HeaderAndList({required this.username});
 
   void _go(BuildContext context, Widget screen) {
-    // Close the drawer, then replace the current page with the target screen.
     Navigator.pop(context);
     Navigator.pushReplacement(
       context,
@@ -85,6 +86,12 @@ class _HeaderAndList extends StatelessWidget {
           title: const Text('Shopping'),
           onTap: () => _go(context, const ShoppingScreen()),
         ),
+        // 👇 NEW — Recipes
+        ListTile(
+          leading: const Icon(Icons.menu_book_outlined),
+          title: const Text('Recipes'),
+          onTap: () => _go(context, const RecipesListScreen()),
+        ),
         const Divider(),
         ListTile(
           leading: const Icon(Icons.group_work_outlined),
@@ -108,8 +115,7 @@ class _HeaderAndList extends StatelessWidget {
           onTap: () async {
             await FirebaseAuth.instance.signOut();
             if (context.mounted) {
-              Navigator.pop(context); // close drawer
-              // You likely have an AuthGate at app root; after signOut it will redirect.
+              Navigator.pop(context);
             }
           },
         ),

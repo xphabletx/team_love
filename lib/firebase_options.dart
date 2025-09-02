@@ -59,4 +59,5 @@ class DefaultFirebaseOptions {
     projectId: 'team-love-9c9b8',
     storageBucket: 'team-love-9c9b8.firebasestorage.app',
   );
+
 }
