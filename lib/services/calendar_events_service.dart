@@ -1,3 +1,4 @@
+// lib/services/calendar_events_service.dart
 import 'package:flutter/material.dart';
 
 /// Simple shared calendar event store with recurrence.
@@ -47,23 +48,41 @@ class CalendarEvents extends ChangeNotifier {
 
     switch (e.repeat) {
       case 'Daily':
-        return start.difference(target).inDays % n == 0
-            ? (target.difference(start).inDays % n == 0)
-            : (target.difference(start).inDays % n == 0);
+        {
+          final days = target.difference(start).inDays;
+          return days >= 0 && days % n == 0;
+        }
       case 'Weekly':
-        final days = target.difference(start).inDays;
-        return days % (7 * n) == 0;
+        {
+          final days = target.difference(start).inDays;
+          return days >= 0 && days % (7 * n) == 0;
+        }
       case 'Monthly':
-        // naive “same day-of-month every n months”
-        final months =
-            (target.year - start.year) * 12 + (target.month - start.month);
-        return months >= 0 && months % n == 0 && start.day == target.day;
+        {
+          // If flagged as "last weekday of month", compute that day for the target month.
+          if (e.meta?['lastWeekdayOfMonth'] == true) {
+            final lastWk = lastWeekdayOfMonth(target.year, target.month);
+            // Only occurs on that computed day each month (every n months)
+            final monthsSinceStart =
+                (target.year - start.year) * 12 + (target.month - start.month);
+            return monthsSinceStart >= 0 &&
+                monthsSinceStart % n == 0 &&
+                _sameDay(lastWk, target);
+          }
+
+          // naive “same day-of-month every n months”
+          final months =
+              (target.year - start.year) * 12 + (target.month - start.month);
+          return months >= 0 && months % n == 0 && start.day == target.day;
+        }
       case 'Yearly':
-        final years = target.year - start.year;
-        return years >= 0 &&
-            years % n == 0 &&
-            start.month == target.month &&
-            start.day == target.day;
+        {
+          final years = target.year - start.year;
+          return years >= 0 &&
+              years % n == 0 &&
+              start.month == target.month &&
+              start.day == target.day;
+        }
       default:
         return false;
     }
@@ -72,6 +91,18 @@ class CalendarEvents extends ChangeNotifier {
   static DateTime _asYmd(DateTime d) => DateTime(d.year, d.month, d.day);
   static bool _sameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
+
+  /// Utility: last weekday (Mon–Fri) of a month.
+  static DateTime lastWeekdayOfMonth(int year, int month) {
+    // last day of month
+    final end = DateTime(year, month + 1, 0);
+    // 1=Mon ... 7=Sun (DateTime.weekday)
+    var d = end;
+    while (d.weekday == DateTime.saturday || d.weekday == DateTime.sunday) {
+      d = d.subtract(const Duration(days: 1));
+    }
+    return _asYmd(d);
+  }
 }
 
 class CalEvent {
@@ -82,7 +113,7 @@ class CalEvent {
     this.repeat = 'None', // None, Daily, Weekly, Monthly, Yearly
     this.every = 1, // repeat every N units (defaults to 1)
     this.reminder = 'None',
-    this.meta, // optional payload (e.g., envelope id)
+    this.meta, // optional payload (e.g., envelope id, flags)
   });
 
   final String id;

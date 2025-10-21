@@ -1,3 +1,17 @@
+// --- Add this block at the very top ---
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    dependencies {
+        // Google Services Gradle plugin (for google-services.json)
+        classpath("com.google.gms:google-services:4.4.2")
+    }
+}
+// --- end add ---
+
 allprojects {
     repositories {
         google()
