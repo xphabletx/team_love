@@ -17,29 +17,17 @@ import 'package:flutter/foundation.dart'
 class DefaultFirebaseOptions {
   static FirebaseOptions get currentPlatform {
     if (kIsWeb) {
-      throw UnsupportedError(
-        'DefaultFirebaseOptions have not been configured for web - '
-        'you can reconfigure this by running the FlutterFire CLI again.',
-      );
+      return web;
     }
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
         return android;
       case TargetPlatform.iOS:
-        throw UnsupportedError(
-          'DefaultFirebaseOptions have not been configured for ios - '
-          'you can reconfigure this by running the FlutterFire CLI again.',
-        );
+        return ios;
       case TargetPlatform.macOS:
-        throw UnsupportedError(
-          'DefaultFirebaseOptions have not been configured for macos - '
-          'you can reconfigure this by running the FlutterFire CLI again.',
-        );
+        return macos;
       case TargetPlatform.windows:
-        throw UnsupportedError(
-          'DefaultFirebaseOptions have not been configured for windows - '
-          'you can reconfigure this by running the FlutterFire CLI again.',
-        );
+        return windows;
       case TargetPlatform.linux:
         throw UnsupportedError(
           'DefaultFirebaseOptions have not been configured for linux - '
@@ -54,10 +42,48 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions android = FirebaseOptions(
     apiKey: 'AIzaSyCHhtRz6hTqtCBhXkDr7nBv793tY4h961E',
-    appId: '1:576026676741:android:3e501157d6d82ab9f2966c',
+    appId: '1:576026676741:android:0e9ade98551ace77f2966c',
     messagingSenderId: '576026676741',
     projectId: 'team-love-9c9b8',
     storageBucket: 'team-love-9c9b8.firebasestorage.app',
+  );
+
+  static const FirebaseOptions web = FirebaseOptions(
+    apiKey: 'AIzaSyCfXoQuWDRDS3pXp5_V-WSc43twHtMOdeI',
+    appId: '1:576026676741:web:a7aedaf437ac1b72f2966c',
+    messagingSenderId: '576026676741',
+    projectId: 'team-love-9c9b8',
+    authDomain: 'team-love-9c9b8.firebaseapp.com',
+    storageBucket: 'team-love-9c9b8.firebasestorage.app',
+    measurementId: 'G-2RT4G6MKY6',
+  );
+
+  static const FirebaseOptions macos = FirebaseOptions(
+    apiKey: 'AIzaSyC7pOcrRSKL_G6MgDd3xH8mIUHWOByTAeY',
+    appId: '1:576026676741:ios:e66920fd50c09e5bf2966c',
+    messagingSenderId: '576026676741',
+    projectId: 'team-love-9c9b8',
+    storageBucket: 'team-love-9c9b8.firebasestorage.app',
+    iosBundleId: 'com.example.teamLoveApp',
+  );
+
+  static const FirebaseOptions ios = FirebaseOptions(
+    apiKey: 'AIzaSyC7pOcrRSKL_G6MgDd3xH8mIUHWOByTAeY',
+    appId: '1:576026676741:ios:e66920fd50c09e5bf2966c',
+    messagingSenderId: '576026676741',
+    projectId: 'team-love-9c9b8',
+    storageBucket: 'team-love-9c9b8.firebasestorage.app',
+    iosBundleId: 'com.example.teamLoveApp',
+  );
+
+  static const FirebaseOptions windows = FirebaseOptions(
+    apiKey: 'AIzaSyCfXoQuWDRDS3pXp5_V-WSc43twHtMOdeI',
+    appId: '1:576026676741:web:2a30e7f287ed234ef2966c',
+    messagingSenderId: '576026676741',
+    projectId: 'team-love-9c9b8',
+    authDomain: 'team-love-9c9b8.firebaseapp.com',
+    storageBucket: 'team-love-9c9b8.firebasestorage.app',
+    measurementId: 'G-Z2XPJSL05M',
   );
 
 }

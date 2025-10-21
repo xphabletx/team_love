@@ -62,7 +62,7 @@ class TeamLoveScreen extends StatelessWidget {
             children: [
               _NavCard(
                 icon: Icons.account_balance_wallet_outlined,
-                label: 'Budget',
+                label: 'Money',
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute(builder: (_) => const BudgetScreen()),

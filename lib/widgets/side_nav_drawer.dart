@@ -12,6 +12,7 @@ import '../screens/account_screen.dart';
 import '../screens/help_screen.dart';
 // 👇 NEW
 import '../screens/recipes_list_screen.dart';
+import '../screens/auth_gate.dart';
 
 class SideNavDrawer extends StatelessWidget {
   const SideNavDrawer({super.key});
@@ -68,7 +69,7 @@ class _HeaderAndList extends StatelessWidget {
         ),
         ListTile(
           leading: const Icon(Icons.account_balance_wallet_outlined),
-          title: const Text('Budget'),
+          title: const Text('Money'),
           onTap: () => _go(context, const BudgetScreen()),
         ),
         ListTile(
@@ -115,7 +116,10 @@ class _HeaderAndList extends StatelessWidget {
           onTap: () async {
             await FirebaseAuth.instance.signOut();
             if (context.mounted) {
-              Navigator.pop(context);
+              Navigator.of(context).pushAndRemoveUntil(
+                MaterialPageRoute(builder: (_) => const AuthGate()),
+                (_) => false,
+              );
             }
           },
         ),

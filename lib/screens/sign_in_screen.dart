@@ -1,6 +1,7 @@
+// lib/screens/sign_in_screen.dart
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import '../services/username_service.dart';
+import '../services/auth_service.dart';
 import 'sign_up_screen.dart';
 
 class SignInScreen extends StatefulWidget {
@@ -11,144 +12,124 @@ class SignInScreen extends StatefulWidget {
 }
 
 class _SignInScreenState extends State<SignInScreen> {
-  final identifier = TextEditingController(); // username OR email
-  final password = TextEditingController();
+  final emailCtrl = TextEditingController();
+  final passCtrl = TextEditingController();
   bool busy = false;
   String? error;
 
   @override
   void dispose() {
-    identifier.dispose();
-    password.dispose();
+    emailCtrl.dispose();
+    passCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _handleSignIn() async {
-    if (!mounted) return;
-
+  Future<void> _signInEmail() async {
     setState(() {
       busy = true;
       error = null;
     });
-
     try {
-      final email = await UsernameService.instance.resolveEmailFromIdentifier(
-        identifier.text.trim(),
+      await AuthService.instance.signInWithEmail(
+        email: emailCtrl.text,
+        password: passCtrl.text,
       );
-
-      await FirebaseAuth.instance.signInWithEmailAndPassword(
-        email: email,
-        password: password.text,
-      );
-
-      if (!mounted) return;
-      // Navigation after sign-in (example)
-      // Navigator.pushReplacementNamed(context, '/team_love');
-    } on StateError catch (e) {
-      if (mounted) {
-        setState(() => error = e.message);
-      }
+      // Don't navigate—AuthGate will react to auth state.
     } on FirebaseAuthException catch (e) {
-      if (mounted) {
-        setState(() => error = e.message ?? e.code);
-      }
+      setState(() => error = e.message);
     } catch (e) {
-      if (mounted) {
-        setState(() => error = e.toString());
-      }
+      setState(() => error = e.toString());
     } finally {
-      if (mounted) {
-        setState(() => busy = false);
-      }
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _google() async {
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await AuthService.instance.signInWithGoogle();
+      // AuthGate will handle the route
+    } catch (e) {
+      setState(() => error = e.toString());
+    } finally {
+      if (mounted) setState(() => busy = false);
     }
   }
 
   Future<void> _forgotPassword() async {
-    final id = identifier.text.trim();
-    if (id.isEmpty) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter your username or email first.')),
-      );
+    final email = emailCtrl.text.trim();
+    if (email.isEmpty) {
+      setState(() => error = 'Enter your email to reset your password.');
       return;
     }
-
     try {
-      final email = await UsernameService.instance.resolveEmailFromIdentifier(
-        id,
-      );
-
       await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
-
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Password reset email sent to $email')),
+        const SnackBar(content: Text('Password reset email sent.')),
       );
-    } on StateError catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(e.message)));
     } on FirebaseAuthException catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(e.message ?? e.code)));
+      setState(() => error = e.message);
+    } catch (e) {
+      setState(() => error = e.toString());
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Sign In')),
-      body: Padding(
+      appBar: AppBar(title: const Text('Sign in')),
+      body: ListView(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            TextField(
-              controller: identifier,
-              decoration: const InputDecoration(
-                labelText: 'Username or Email',
-                helperText: 'You can sign in with either one',
-              ),
-              textInputAction: TextInputAction.next,
+        children: [
+          TextField(
+            controller: emailCtrl,
+            decoration: const InputDecoration(labelText: 'Email'),
+            keyboardType: TextInputType.emailAddress,
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: passCtrl,
+            decoration: const InputDecoration(labelText: 'Password'),
+            obscureText: true,
+          ),
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: busy ? null : _forgotPassword,
+              child: const Text('Forgot password?'),
             ),
-            TextField(
-              controller: password,
-              decoration: const InputDecoration(labelText: 'Password'),
-              obscureText: true,
-              onSubmitted: (_) => _handleSignIn(),
-            ),
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton(
-                onPressed: busy ? null : _forgotPassword,
-                child: const Text('Forgot password?'),
-              ),
-            ),
-            if (error != null)
-              Text(error!, style: const TextStyle(color: Colors.red)),
-            const SizedBox(height: 8),
-            FilledButton(
-              onPressed: busy ? null : _handleSignIn,
-              child: const Text('Sign In'),
-            ),
-            const SizedBox(height: 12),
-            TextButton(
-              onPressed: busy
-                  ? null
-                  : () {
-                      if (!mounted) return;
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const SignUpScreen()),
-                      );
-                    },
-              child: const Text('Create an account'),
-            ),
+          ),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: busy ? null : _signInEmail,
+            child: const Text('Sign in'),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: busy ? null : _google,
+            icon: const Icon(Icons.account_circle),
+            label: const Text('Sign in with Google'),
+          ),
+          const SizedBox(height: 16),
+          TextButton(
+            onPressed: busy
+                ? null
+                : () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const SignUpScreen()),
+                  ),
+            child: const Text('Create account'),
+          ),
+          if (error != null) ...[
+            const SizedBox(height: 16),
+            Text(error!, style: TextStyle(color: theme.colorScheme.error)),
           ],
-        ),
+        ],
       ),
     );
   }
