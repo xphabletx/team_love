@@ -1,9 +1,14 @@
+// lib/services/meal_plan_service.dart
+// ─────────────────────────────────────────────────────────────
+// Alternate/local plan service (not used by MealsScreen right now).
+// Kept here if another screen uses it; refactored with clear sections.
+// ─────────────────────────────────────────────────────────────
+
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// ===== Models ===============================================================
-
+/// ───────────────────────── Models ─────────────────────────
 enum MealType { lunch, dinner }
 
 class MealEntry {
@@ -14,7 +19,7 @@ class MealEntry {
     this.ingredientsAdded = 0,
   });
 
-  String userName; // 'you' | 'partner' | etc (future: workspace users)
+  String userName; // 'you' | 'partner' | etc
   List<String> items;
   bool sharedDinner;
   int ingredientsAdded;
@@ -57,14 +62,13 @@ class DayMeals {
   );
 }
 
-/// ===== Service ==============================================================
-/// Single source of truth for the meal plan. Persists to SharedPreferences so
-/// hot reloads / app restarts restore automatically.
+/// ───────────────────────── Service ────────────────────────
+/// Single source of truth for a meal plan (alternative to MealsStore).
 class MealPlanService extends ChangeNotifier {
   MealPlanService._();
   static final MealPlanService instance = MealPlanService._();
 
-  // Persistence keys
+  // Keys
   static const _kState = 'teamlove_meal_plan_state_v1';
   static const _kSuggestions = 'teamlove_meal_suggestions_v1';
   static const _kCalPref = 'teamlove_meal_cal_persistent_v1';
@@ -81,16 +85,13 @@ class MealPlanService extends ChangeNotifier {
   // Users visible in sheet (replace later with workspace users)
   final List<String> users = const ['you', 'partner'];
 
-  // Public getters
+  // Getters
   DateTime? get startDate => _start;
   DateTime? get endDate => _end;
   bool get addToCalendarPersistent => _addToCalendarPersistent;
-
-  /// Returns a read-only copy of the custom suggestions.
   Set<String> get customSuggestions => {..._customSuggestions};
 
-  /// Merge helper for screens that keep a big built-in list.
-  /// Pass your monster list; this adds any locally-learned items on top.
+  // ───── Suggestions merge helper ─────
   List<String> mergeSuggestions(List<String> builtIn) {
     final seen = <String>{};
     final out = <String>[];
@@ -108,7 +109,7 @@ class MealPlanService extends ChangeNotifier {
     return out;
   }
 
-  /// Async one-time load
+  // ───── Load/Save ─────
   Future<void> ensureLoaded() async {
     if (_loaded) return;
     final prefs = await SharedPreferences.getInstance();
@@ -160,7 +161,7 @@ class MealPlanService extends ChangeNotifier {
     await prefs.setBool(_kCalPref, _addToCalendarPersistent);
   }
 
-  /// Utility: normalize to yyyy-MM-dd
+  // ───── Helpers ─────
   String keyOf(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-'
       '${d.month.toString().padLeft(2, '0')}-'
@@ -176,8 +177,7 @@ class MealPlanService extends ChangeNotifier {
     return _byKey[k] ?? DayMeals();
   }
 
-  /// Create (or replace) the active plan range. Does not wipe existing data
-  /// unless you pass wipeOutside=true.
+  // ───── Mutations ─────
   Future<void> createPlan(
     DateTime start,
     DateTime end, {
@@ -185,12 +185,10 @@ class MealPlanService extends ChangeNotifier {
   }) async {
     await ensureLoaded();
 
-    // enforce rules: cannot start before today except allow "today"
     final today = DateTime.now();
     final dayOnly = DateTime(today.year, today.month, today.day);
     if (start.isBefore(dayOnly)) start = dayOnly;
 
-    // clamp max length to 31 days
     if (end.difference(start).inDays > 31) {
       end = start.add(const Duration(days: 31));
     }
@@ -213,7 +211,6 @@ class MealPlanService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Change the range, optionally dropping meals outside the new range.
   Future<void> changePlanRange(
     DateTime start,
     DateTime end, {
@@ -222,7 +219,6 @@ class MealPlanService extends ChangeNotifier {
     await createPlan(start, end, wipeOutside: wipeOutside);
   }
 
-  /// Remove plan dates + meals
   Future<void> resetPlan() async {
     await ensureLoaded();
     _start = null;
@@ -232,7 +228,6 @@ class MealPlanService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Add a meal entry to a date + type
   Future<void> addMeal({
     required DateTime date,
     required MealType type,
@@ -244,7 +239,6 @@ class MealPlanService extends ChangeNotifier {
     final list = (type == MealType.lunch) ? dm.lunch : dm.dinner;
     list.add(entry);
 
-    // learn any new items as suggestions
     for (final s in [...entry.items, ...learnedSuggestions]) {
       final t = s.trim();
       if (t.isEmpty) continue;
@@ -286,7 +280,6 @@ class MealPlanService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// For convenience in UIs that need all dates in range.
   List<DateTime> currentRangeDays() {
     if (_start == null || _end == null) return const [];
     final out = <DateTime>[];

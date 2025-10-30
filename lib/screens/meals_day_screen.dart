@@ -1,3 +1,13 @@
+// lib/screens/meals_day_screen.dart
+// ─────────────────────────────────────────────────────────────────────────────
+// Updates:
+//  • MealEntry now stores an `ingredients` list so we can reuse what you typed.
+//  • "Add items to shopping list" now shows a selector with two tabs (Meal /
+//    Ingredients), checkboxes, remembers selections while toggling, floating
+//    Save button, and a "discard or save" prompt if backing out.
+//  • Entry rendering shows meal items as BOLD bullet points.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -7,18 +17,13 @@ import '../services/shopping_service.dart';
 import '../services/calendar_events_service.dart';
 
 /// ───────────────────────────────────────────────────────────────────────────
-/// MealsStore: source of truth for plan range, meals by *date*, calendar
-/// mirroring preference, and custom suggestions. Persists everything.
-/// Keeps legacy week buckets so older screens continue working.
+/// MealsStore (local, offline-first)
 /// ───────────────────────────────────────────────────────────────────────────
 class MealsStore {
   MealsStore._();
   static final MealsStore instance = MealsStore._();
 
-  /// Pretend workspace users (replace with real consent later)
-  final List<String> users = const ['you', 'partner'];
-
-  // Legacy week buckets (keep so old code still works)
+  // Legacy week buckets (kept)
   final Map<String, DayMeals> _byDay = {
     for (final d in const [
       'Monday',
@@ -33,17 +38,16 @@ class MealsStore {
   };
   DayMeals day(String dayName) => _byDay[dayName] ??= DayMeals();
 
-  // New: meals by *date* (yyyy-MM-dd)
+  // New by-date storage (yyyy-MM-dd)
   final Map<String, DayMeals> _byDate = <String, DayMeals>{};
 
   DateTime? planStart; // date-only
   DateTime? planEnd; // date-only
 
   bool syncToCalendar = false; // persistent opt-in
-  List<String> customSuggestions =
-      <String>[]; // persistent (kept for prefs shape)
+  List<String> customSuggestions = <String>[];
 
-  // Keys
+  // Pref keys
   static const _prefsKeySync = 'teamlove_meals_syncToCalendar_v1';
   static const _prefsKeyCustom = 'teamlove_meals_custom_suggestions_v1';
   static const _prefsKeyWeek = 'teamlove_meals_week_state_v1';
@@ -147,13 +151,10 @@ class MealsStore {
 
   Future<void> saveState() async {
     final prefs = await SharedPreferences.getInstance();
-
     final weekJson = jsonEncode(_byDay.map((k, v) => MapEntry(k, v.toJson())));
     await prefs.setString(_prefsKeyWeek, weekJson);
-
     final planJson = jsonEncode(_byDate.map((k, v) => MapEntry(k, v.toJson())));
     await prefs.setString(_prefsKeyPlanMeals, planJson);
-
     await _savePlanRange(prefs);
     await prefs.setStringList(_prefsKeyCustom, customSuggestions);
     await prefs.setBool(_prefsKeySync, syncToCalendar);
@@ -214,7 +215,7 @@ class MealsStore {
   }
 }
 
-/// Simple container for a day’s lunch/dinner entries.
+/// Container for a day’s lunch/dinner entries.
 class DayMeals {
   DayMeals({List<MealEntry>? lunch, List<MealEntry>? dinner})
     : lunch = lunch ?? <MealEntry>[],
@@ -244,10 +245,12 @@ class MealEntry {
     required this.userName,
     required this.items,
     this.sharedDinner = false,
-  });
+    List<String>? ingredients,
+  }) : ingredients = ingredients ?? <String>[];
 
   String userName; // 'you' / 'partner' / '[shared]' via sharedDinner
-  final List<String> items; // merged list of meal items
+  final List<String> items; // meal items (displayed as bullets)
+  final List<String> ingredients; // ingredient lines you typed earlier
   bool sharedDinner;
 
   int ingredientsAdded = 0; // count pushed to shopping list
@@ -255,6 +258,7 @@ class MealEntry {
   Map<String, dynamic> toJson() => {
     'userName': userName,
     'items': items,
+    'ingredients': ingredients,
     'sharedDinner': sharedDinner,
     'ingredientsAdded': ingredientsAdded,
   };
@@ -262,6 +266,9 @@ class MealEntry {
   factory MealEntry.fromJson(Map<String, dynamic> m) => MealEntry(
     userName: m['userName'] as String? ?? 'you',
     items: (m['items'] as List<dynamic>? ?? const []).cast<String>().toList(),
+    ingredients: (m['ingredients'] as List<dynamic>? ?? const [])
+        .cast<String>()
+        .toList(),
     sharedDinner: m['sharedDinner'] as bool? ?? false,
   )..ingredientsAdded = (m['ingredientsAdded'] as num?)?.toInt() ?? 0;
 }
@@ -271,7 +278,7 @@ enum MealType { lunch, dinner }
 class MealsDayScreen extends StatefulWidget {
   const MealsDayScreen({super.key, required this.date, this.initialAddFor});
 
-  final DateTime date; // this screen always edits by date
+  final DateTime date; // edits by date
   final MealType? initialAddFor;
 
   @override
@@ -344,7 +351,6 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
       CalEvent(
         id: id,
         title: title,
-        // Keep date-only (midnight) but mark as all-day via meta so UI hides time.
         date: DateTime(widget.date.year, widget.date.month, widget.date.day),
         repeat: 'None',
         every: 1,
@@ -353,29 +359,26 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
           'type': 'meal',
           'mealType': isLunch ? 'lunch' : 'dinner',
           'date': _dateKey(widget.date),
-          'allDay': true, // calendar UI can use this to suppress 00:00:00.000
+          'allDay': true,
         },
       ),
     );
   }
 
-  /// Remove calendar event for this date+meal
   void _removeFromCalendar({required bool isLunch}) {
     final id = 'meal:${_dateKey(widget.date)}:${isLunch ? 'lunch' : 'dinner'}';
     CalendarEvents.instance.remove(id);
   }
 
-  // Add / Edit bottom sheet (no suggestions; keeps Meal/Ingredients switch)
+  // Add / Edit bottom sheet
   Future<void> _addMeal({required bool isLunch}) async {
     await MealsStore.instance.ensureLoaded();
-    if (!mounted) return; // guard context use after await
+    if (!mounted) return;
 
-    // Workspace gate (hidden for now)
-    const bool hasWorkspace = false;
-    String selectedTag = 'You'; // only if hasWorkspace==true
-
+    // persistent cal checkbox
     bool syncToCalendar = MealsStore.instance.syncToCalendar;
 
+    // temp buffers while editing
     final mealItems = <String>[];
     final ingItems = <String>[];
 
@@ -426,42 +429,6 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                 ),
                 const SizedBox(height: 10),
 
-                // Workspace tags (hidden by default)
-                if (hasWorkspace) ...[
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: Wrap(
-                      spacing: 6,
-                      children: ['You', 'Partner', 'Shared'].map((t) {
-                        final on = selectedTag == t;
-                        return ChoiceChip(
-                          label: Text(t),
-                          selected: on,
-                          onSelected: (_) => setSB(() => selectedTag = t),
-                        );
-                      }).toList(),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                ],
-
-                // Ingredient mode shows a small meal summary
-                if (ingredientMode && mealItems.isNotEmpty) ...[
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Theme.of(ctx).colorScheme.surfaceContainerHighest,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      'Meal: ${mealItems.join(', ')}',
-                      style: const TextStyle(fontStyle: FontStyle.italic),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                ],
-
                 if (!ingredientMode) ...[
                   // MEAL mode
                   Row(
@@ -503,15 +470,46 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                     const SizedBox(height: 8),
                     Align(
                       alignment: Alignment.centerLeft,
-                      child: Wrap(
-                        spacing: 6,
-                        runSpacing: -8,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: mealItems
                             .map(
-                              (s) => InputChip(
-                                label: Text(s),
-                                onDeleted: () =>
-                                    setSB(() => mealItems.remove(s)),
+                              (s) => Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 2,
+                                ),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      '•  ',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    Expanded(
+                                      child: Text(
+                                        s,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                        softWrap: true,
+                                        overflow: TextOverflow.visible,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.close),
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 32,
+                                        minHeight: 32,
+                                      ),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: () =>
+                                          setSB(() => mealItems.remove(s)),
+                                    ),
+                                  ],
+                                ),
                               ),
                             )
                             .toList(),
@@ -559,15 +557,46 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                     const SizedBox(height: 8),
                     Align(
                       alignment: Alignment.centerLeft,
-                      child: Wrap(
-                        spacing: 6,
-                        runSpacing: -8,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: ingItems
                             .map(
-                              (s) => InputChip(
-                                label: Text(s),
-                                onDeleted: () =>
-                                    setSB(() => ingItems.remove(s)),
+                              (s) => Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 2,
+                                ),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      '•  ',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    Expanded(
+                                      child: Text(
+                                        s,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                        softWrap: true,
+                                        overflow: TextOverflow.visible,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.close),
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 32,
+                                        minHeight: 32,
+                                      ),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: () =>
+                                          setSB(() => ingItems.remove(s)),
+                                    ),
+                                  ],
+                                ),
                               ),
                             )
                             .toList(),
@@ -596,34 +625,24 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
                 Align(
                   alignment: Alignment.centerRight,
                   child: FilledButton(
-                    // Always enabled so you can toggle the checkbox and save.
                     onPressed: () async {
                       final navigator = Navigator.of(ctx);
 
-                      // Merge into existing entry (only if user added meal items)
-                      if (mealItems.isNotEmpty) {
-                        final list = isLunch ? _day.lunch : _day.dinner;
-                        final match = list.firstWhere(
-                          (e) => e.userName == 'you',
-                          orElse: () => MealEntry(
-                            userName: 'you',
-                            items: [],
-                            sharedDinner: false,
-                          ),
-                        );
-                        if (!list.contains(match)) list.add(match);
-                        match.items.addAll(mealItems);
-                      }
+                      // Merge into existing entry (only if user added meal items/ingredients)
+                      final list = isLunch ? _day.lunch : _day.dinner;
+                      // find or create entry for 'you'
+                      final entry = list.firstWhere(
+                        (e) => e.userName == 'you',
+                        orElse: () => MealEntry(userName: 'you', items: []),
+                      );
+                      if (!list.contains(entry)) list.add(entry);
 
-                      // Ingredients -> Shopping
-                      for (final ing in ingItems) {
-                        ShoppingService.instance.add(ing);
+                      if (mealItems.isNotEmpty) {
+                        entry.items.addAll(mealItems);
                       }
                       if (ingItems.isNotEmpty) {
-                        final list = isLunch ? _day.lunch : _day.dinner;
-                        if (list.isNotEmpty) {
-                          list.first.ingredientsAdded += ingItems.length;
-                        }
+                        // Store ingredients with the entry so we can select later
+                        entry.ingredients.addAll(ingItems);
                       }
 
                       // Persist meals & preference
@@ -655,108 +674,161 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
     ingFocus.dispose();
   }
 
-  Future<void> _addIngredientToShopping(MealEntry entry) async {
-    final ctrl = TextEditingController();
-    final focus = FocusNode();
+  // New: selector for sending items to Shopping (checkbox, tabs, remembers)
+  Future<void> _addItemsToShoppingSelector(MealEntry entry) async {
+    final mealChoices = [...entry.items];
+    final ingChoices = [...entry.ingredients];
+
+    // nothing to choose?
+    if (mealChoices.isEmpty && ingChoices.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No items yet. Add meal or ingredient lines first.'),
+        ),
+      );
+      return;
+    }
+
+    final selected = <String>{};
+    bool showIngredients = false;
+
+    bool hasUnsaved() => selected.isNotEmpty;
+
+    Future<bool> confirmDiscard(BuildContext ctx) async {
+      if (!hasUnsaved()) return true;
+      final ok =
+          await showDialog<bool>(
+            context: ctx,
+            builder: (dctx) => AlertDialog(
+              title: const Text('Discard selections?'),
+              content: const Text(
+                'You have selected items. Save them to the shopping list or discard.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dctx, false),
+                  child: const Text('Keep editing'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(dctx, true),
+                  child: const Text('Discard'),
+                ),
+              ],
+            ),
+          ) ??
+          false;
+      return ok;
+    }
 
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSB) {
-          void add(String name) async {
-            final n = name.trim();
-            if (n.isEmpty) return;
-            ShoppingService.instance.add(n);
-            if (!mounted) return;
-            setState(() => entry.ingredientsAdded++);
-            setSB(() {
-              ctrl.clear();
-              focus.requestFocus();
+          final list = showIngredients ? ingChoices : mealChoices;
+
+          Future<void> onSave() async {
+            for (final name in selected) {
+              ShoppingService.instance.add(name);
+            }
+            setState(() {
+              entry.ingredientsAdded += selected.length;
             });
             await MealsStore.instance.saveState();
+            if (mounted) Navigator.pop(ctx);
           }
 
-          return Padding(
-            padding: EdgeInsets.only(
-              left: 16,
-              right: 16,
-              top: 16,
-              bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  'Add ingredients to shopping list',
-                  style: Theme.of(ctx).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 8),
-                AppInputs.textField(
-                  controller: ctrl,
-                  focusNode: focus,
-                  decoration: const InputDecoration(labelText: 'Ingredient'),
-                  onChanged: (_) =>
-                      setSB(() {}), // kept for live validation feel
-                  onSubmitted: add,
-                ),
-                const SizedBox(height: 8),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: FilledButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    child: const Text('Done'),
+          return WillPopScope(
+            onWillPop: () async => await confirmDiscard(ctx),
+            child: Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 16,
+                bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Header + toggle
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Add items to shopping',
+                          style: Theme.of(ctx).textTheme.titleMedium,
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                          softWrap: false,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        fit: FlexFit.loose,
+                        child: SegmentedButton<bool>(
+                          segments: const [
+                            ButtonSegment(value: false, label: Text('Meal')),
+                            ButtonSegment(
+                              value: true,
+                              label: Text('Ingredients'),
+                            ),
+                          ],
+                          selected: {showIngredients},
+                          onSelectionChanged: (s) =>
+                              setSB(() => showIngredients = s.first),
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-              ],
+
+                  // The selectable list
+                  Flexible(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 420),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: list.length,
+                        itemBuilder: (_, i) {
+                          final item = list[i];
+                          final checked = selected.contains(item);
+                          return CheckboxListTile(
+                            value: checked,
+                            onChanged: (v) {
+                              setSB(() {
+                                if (v == true) {
+                                  selected.add(item);
+                                } else {
+                                  selected.remove(item);
+                                }
+                              });
+                            },
+                            title: Text(item),
+                            controlAffinity: ListTileControlAffinity.leading,
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // Floating save button
+                  Align(
+                    alignment: Alignment.center,
+                    child: FloatingActionButton.extended(
+                      heroTag: 'add_items_save',
+                      onPressed: selected.isEmpty ? null : onSave,
+                      label: const Text('Save'),
+                      icon: const Icon(Icons.check),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+              ),
             ),
           );
         },
       ),
-    );
-
-    ctrl.dispose();
-    focus.dispose();
-  }
-
-  // FAB actions (UI stubs)
-  void _openFab() {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Text('🖼️', style: TextStyle(fontSize: 22)),
-              title: const Text('Add image (gallery/camera/link)'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _pickImageForDay();
-              },
-            ),
-            ListTile(
-              leading: const Text('📦', style: TextStyle(fontSize: 22)),
-              title: const Text('Scan barcode (Open Food Facts)'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _scanBarcodeForDay();
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _pickImageForDay() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Image picker TODO (storage ready later)')),
-    );
-  }
-
-  void _scanBarcodeForDay() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Barcode scan TODO (Open Food Facts)')),
     );
   }
 
@@ -788,7 +860,33 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
         ],
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: _openFab,
+        onPressed: () {
+          showModalBottomSheet<void>(
+            context: context,
+            builder: (ctx) => SafeArea(
+              child: Wrap(
+                children: [
+                  ListTile(
+                    leading: const Text('🖼️', style: TextStyle(fontSize: 22)),
+                    title: const Text('Add image (gallery/camera/link)'),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _pickImageForDay();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Text('📦', style: TextStyle(fontSize: 22)),
+                    title: const Text('Scan barcode (Open Food Facts)'),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _scanBarcodeForDay();
+                    },
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
         child: const Icon(Icons.add),
       ),
     );
@@ -844,23 +942,56 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
   }
 
   Widget _buildEntryTile(MealEntry e) {
-    final subtitle = [
-      if (e.sharedDinner) '[shared]',
-      if (e.items.isNotEmpty) e.items.join(', '),
-      if (e.ingredientsAdded > 0) '• ${e.ingredientsAdded} ingredients added',
-    ].join('  ');
+    // Bullet list (bold) of meal items
+    final bullets = e.items.isEmpty
+        ? const [Text('—')]
+        : e.items
+              .map(
+                (s) => Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '•  ',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    Expanded(
+                      child: Text(
+                        s,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ],
+                ),
+              )
+              .toList();
+
+    final subBits = <String>[];
+    if (e.sharedDinner) subBits.add('[shared]');
+    if (e.ingredients.isNotEmpty)
+      subBits.add('Ingredients: ${e.ingredients.length}');
+    if (e.ingredientsAdded > 0)
+      subBits.add('• ${e.ingredientsAdded} added to shopping');
 
     return ListTile(
       leading: const Icon(Icons.restaurant_menu),
       title: Text(e.userName),
-      subtitle: Text(subtitle),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ...bullets,
+          if (subBits.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(subBits.join('  ')),
+          ],
+        ],
+      ),
       trailing: Wrap(
         spacing: 4,
         children: [
           IconButton(
-            tooltip: 'Add ingredients to shopping',
+            tooltip: 'Add items to shopping',
             icon: const Icon(Icons.add_shopping_cart),
-            onPressed: () => _addIngredientToShopping(e),
+            onPressed: () => _addItemsToShoppingSelector(e),
           ),
           IconButton(
             tooltip: 'Delete entry',
@@ -875,6 +1006,18 @@ class _MealsDayScreenState extends State<MealsDayScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  void _pickImageForDay() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Image picker TODO (storage ready later)')),
+    );
+  }
+
+  void _scanBarcodeForDay() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Barcode scan TODO (Open Food Facts)')),
     );
   }
 }

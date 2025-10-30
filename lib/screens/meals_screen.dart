@@ -1,3 +1,4 @@
+// lib/screens/meals_screen.dart
 import 'package:flutter/material.dart';
 import '../widgets/side_nav_drawer.dart';
 import 'meals_day_screen.dart'; // provides MealsStore, DayMeals, MealEntry, MealType
@@ -42,9 +43,12 @@ class _MealsScreenState extends State<MealsScreen> {
   String _fmtDate(DateTime d) =>
       '${_wk[d.weekday - 1]} ${d.day} ${_mo[d.month - 1]}';
   String _key(DateTime d) =>
-      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
   DateTime _d(DateTime x) => DateTime(x.year, x.month, x.day);
 
+  /// Built-in holiday-style picker: tap start, tap end, span is highlighted.
   Future<DateTimeRange?> _pickRange({
     DateTime? initialStart,
     DateTime? initialEnd,
@@ -52,34 +56,31 @@ class _MealsScreenState extends State<MealsScreen> {
     final today = _d(DateTime.now());
     final firstDate = today;
     final lastDate = today.add(const Duration(days: 31));
+
     final result = await showDateRangePicker(
       context: context,
       firstDate: firstDate,
       lastDate: lastDate,
       initialDateRange: (initialStart != null && initialEnd != null)
-          ? DateTimeRange(start: initialStart, end: initialEnd)
+          ? DateTimeRange(start: _d(initialStart), end: _d(initialEnd))
           : null,
       helpText: 'Select meal plan start and end',
       saveText: 'Done',
     );
     if (result == null) return null;
+
     final start = _d(result.start);
     final end = _d(result.end);
     final len = end.difference(start).inDays + 1;
-    if (start.isBefore(today)) {
-      _toast('Start date cannot be in the past.');
-      return null;
-    }
-    if (len > 31) {
-      _toast('Plan cannot exceed 31 days.');
-      return null;
-    }
+    if (start.isBefore(today)) return null;
+    if (len > 31) return null;
     return DateTimeRange(start: start, end: end);
   }
 
   Future<void> _createNewPlan() async {
     final r = await _pickRange();
     if (r == null) return;
+
     await MealsStore.instance.setPlan(r.start, r.end, wipeOld: true);
     if (!mounted) return;
     setState(() {
@@ -93,6 +94,7 @@ class _MealsScreenState extends State<MealsScreen> {
     final store = MealsStore.instance;
     final prevStart = store.planStart;
     final prevEnd = store.planEnd;
+
     final r = await _pickRange(initialStart: prevStart, initialEnd: prevEnd);
     if (r == null) return;
 
@@ -107,6 +109,7 @@ class _MealsScreenState extends State<MealsScreen> {
         if (cur.isBefore(r.start) || cur.isAfter(r.end)) removed.add(cur);
       }
       if (removed.isNotEmpty) {
+        if (!mounted) return; // guard context before dialog
         proceed =
             await showDialog<bool>(
               context: context,
@@ -137,13 +140,10 @@ class _MealsScreenState extends State<MealsScreen> {
     setState(() {
       final valid = store.datesInPlan.map(_key).toSet();
       _expandedKeys.removeWhere((k) => !valid.contains(k));
-      if (_expandedKeys.isEmpty && valid.isNotEmpty)
+      if (_expandedKeys.isEmpty && valid.isNotEmpty) {
         _expandedKeys.add(valid.first);
+      }
     });
-  }
-
-  void _toast(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   void _openFab() {
@@ -180,9 +180,10 @@ class _MealsScreenState extends State<MealsScreen> {
     );
   }
 
-  // — collapsed line helpers (force Lunch+Dinner to two lines)
+  // Collapsed row helpers
   String _truncate(String s, int maxChars) =>
       s.length <= maxChars ? s : '${s.substring(0, maxChars).trim()}…';
+
   String _collapsedLine(List<MealEntry> list, {int maxChars = 80}) {
     if (list.isEmpty) return '—';
     final items = <String>[];
@@ -197,6 +198,22 @@ class _MealsScreenState extends State<MealsScreen> {
     final lunchLine = _collapsedLine(dm.lunch, maxChars: 80);
     final dinnerLine = _collapsedLine(dm.dinner, maxChars: 80);
     return 'Lunch: $lunchLine\nDinner: $dinnerLine';
+  }
+
+  bool _hasData(List<MealEntry> list) {
+    for (final e in list) {
+      if (e.items.isNotEmpty) return true;
+    }
+    return false;
+  }
+
+  String _statusSubtitle(DayMeals dm) {
+    final lunchOk = _hasData(dm.lunch);
+    final dinnerOk = _hasData(dm.dinner);
+    final lunch = lunchOk ? 'Lunch: ✅' : 'Lunch: —';
+    final dinner = dinnerOk ? 'Dinner: ✅' : 'Dinner: —';
+    // compact single line; tweak separators if you prefer
+    return '$lunch  •  $dinner';
   }
 
   Widget _buildMealTile({
@@ -267,11 +284,10 @@ class _MealsScreenState extends State<MealsScreen> {
             leading: const Icon(Icons.calendar_today_outlined),
             title: Text(_fmtDate(date)),
             subtitle: Text(
-              _collapsedSubtitle(dm),
-              maxLines:
-                  2, // <— force exactly 2 lines so Dinner is always visible
+              _statusSubtitle(dm),
+              maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              softWrap: true,
+              softWrap: false,
             ),
             trailing: IconButton(
               tooltip: expanded ? 'Collapse' : 'Expand',
@@ -342,7 +358,7 @@ class _MealsScreenState extends State<MealsScreen> {
           ),
         ],
       ),
-      drawer: const SideNavDrawer(), // <— integrated
+      drawer: const SideNavDrawer(),
       body: !hasPlan
           ? Center(
               child: Padding(

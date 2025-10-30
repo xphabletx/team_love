@@ -1,1 +1,53 @@
-{"flutter":{"platforms":{"android":{"default":{"projectId":"team-love-9c9b8","appId":"1:576026676741:android:0e9ade98551ace77f2966c","fileOutput":"android/app/google-services.json"}},"dart":{"lib/firebase_options.dart":{"projectId":"team-love-9c9b8","configurations":{"android":"1:576026676741:android:0e9ade98551ace77f2966c","ios":"1:576026676741:ios:e66920fd50c09e5bf2966c","macos":"1:576026676741:ios:e66920fd50c09e5bf2966c","web":"1:576026676741:web:a7aedaf437ac1b72f2966c","windows":"1:576026676741:web:2a30e7f287ed234ef2966c"}}},"ios":{"default":{"projectId":"team-love-9c9b8","appId":"1:576026676741:ios:e66920fd50c09e5bf2966c","uploadDebugSymbols":false,"fileOutput":"ios/Runner/GoogleService-Info.plist"}},"macos":{"default":{"projectId":"team-love-9c9b8","appId":"1:576026676741:ios:e66920fd50c09e5bf2966c","uploadDebugSymbols":false,"fileOutput":"macos/Runner/GoogleService-Info.plist"}}}}}
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "team-love-9c9b8",
+          "appId": "1:576026676741:android:0e9ade98551ace77f2966c",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "team-love-9c9b8",
+          "configurations": {
+            "android": "1:576026676741:android:0e9ade98551ace77f2966c",
+            "ios": "1:576026676741:ios:e66920fd50c09e5bf2966c",
+            "macos": "1:576026676741:ios:e66920fd50c09e5bf2966c",
+            "web": "1:576026676741:web:a7aedaf437ac1b72f2966c",
+            "windows": "1:576026676741:web:2a30e7f287ed234ef2966c"
+          }
+        }
+      },
+      "ios": {
+        "default": {
+          "projectId": "team-love-9c9b8",
+          "appId": "1:576026676741:ios:e66920fd50c09e5bf2966c",
+          "uploadDebugSymbols": false,
+          "fileOutput": "ios/Runner/GoogleService-Info.plist"
+        }
+      },
+      "macos": {
+        "default": {
+          "projectId": "team-love-9c9b8",
+          "appId": "1:576026676741:ios:e66920fd50c09e5bf2966c",
+          "uploadDebugSymbols": false,
+          "fileOutput": "macos/Runner/GoogleService-Info.plist"
+        }
+      }
+    }
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "ui": {
+      "enabled": true
+    },
+    "singleProjectMode": true
+  }
+}

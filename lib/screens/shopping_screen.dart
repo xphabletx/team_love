@@ -1,7 +1,12 @@
 import 'package:flutter/material.dart';
-import '../services/shopping_service.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
 import '../services/input_service.dart';
 import '../services/calendar_events_service.dart';
+import '../services/shopping_repo.dart'; // Firestore repo (defines ShoppingDoc)
+import '../services/local_shopping_store.dart'; // Pure offline store
+import '../services/shopping_migration_service.dart';
 
 class ShoppingScreen extends StatefulWidget {
   const ShoppingScreen({super.key});
@@ -11,22 +16,12 @@ class ShoppingScreen extends StatefulWidget {
 
 class _ShoppingScreenState extends State<ShoppingScreen> {
   bool _removeMode = false;
-  final Set<String> _selectedNames = <String>{};
+  final Set<String> _selectedIds = <String>{}; // used in BOTH modes
+  final _repo = ShoppingRepo(FirebaseFirestore.instance);
 
-  @override
-  void initState() {
-    super.initState();
-    // Rebuild when Meals adds/removes items
-    ShoppingService.instance.addListener(_onChanged);
-  }
-
-  @override
-  void dispose() {
-    ShoppingService.instance.removeListener(_onChanged);
-    super.dispose();
-  }
-
-  void _onChanged() => setState(() {});
+  String? _workspaceId; // null => offline/local mode
+  String? _lastWorkspaceId;
+  bool get _usingWorkspace => _workspaceId != null && _workspaceId!.isNotEmpty;
 
   // ── Add item manually ──────────────────────────────────────────────────────
   void _addItemManually() {
@@ -57,7 +52,11 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
   void _finishAdd(TextEditingController ctrl, BuildContext ctx) {
     final name = ctrl.text.trim();
     if (name.isNotEmpty) {
-      ShoppingService.instance.add(name);
+      if (_usingWorkspace) {
+        _repo.add(_workspaceId!, name);
+      } else {
+        LocalShoppingStore.instance.add(name);
+      }
     }
     Navigator.pop(ctx);
   }
@@ -66,25 +65,26 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
   void _enterRemoveMode() {
     setState(() {
       _removeMode = true;
-      _selectedNames.clear();
+      _selectedIds.clear();
     });
   }
 
   void _exitRemoveMode() {
     setState(() {
       _removeMode = false;
-      _selectedNames.clear();
+      _selectedIds.clear();
     });
   }
 
   Future<void> _confirmDeleteSelected() async {
-    if (_selectedNames.isEmpty) return;
+    if (_selectedIds.isEmpty) return;
+
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Delete selected items?'),
         content: Text(
-          'This will remove ${_selectedNames.length} item(s) from your list.',
+          'This will remove ${_selectedIds.length} item(s) from your list.',
         ),
         actions: [
           TextButton(
@@ -101,16 +101,17 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
     );
     if (ok != true) return;
 
-    // Remove one-by-one via the service (keeps persistence consistent).
-    for (final n in _selectedNames) {
-      ShoppingService.instance.remove(n); // <-- adjust if your API differs
+    if (_usingWorkspace) {
+      for (final id in _selectedIds) {
+        await _repo.remove(_workspaceId!, id);
+      }
+    } else {
+      await LocalShoppingStore.instance.removeMany(_selectedIds);
     }
     _exitRemoveMode();
   }
 
   Future<void> _confirmDeleteAll() async {
-    final items = ShoppingService.instance.items;
-    if (items.isEmpty) return;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -131,9 +132,17 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
     );
     if (ok != true) return;
 
-    // Clear by removing each (works with simple service APIs).
-    for (final it in List.of(items)) {
-      ShoppingService.instance.remove(it.name); // adjust if needed
+    if (_usingWorkspace) {
+      final col = FirebaseFirestore.instance
+          .collection('workspaces')
+          .doc(_workspaceId!)
+          .collection('shoppingItems');
+      final snap = await col.get();
+      for (final d in snap.docs) {
+        await d.reference.delete();
+      }
+    } else {
+      await LocalShoppingStore.instance.clearAll();
     }
     _exitRemoveMode();
   }
@@ -157,7 +166,7 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
       CalEvent(
         id: id,
         title: 'Shopping trip',
-        date: d, // date-only (no time codes)
+        date: d,
         repeat: 'None',
         every: 1,
         reminder: 'None',
@@ -179,7 +188,6 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
   String _nameFromBarcode(String code) {
     final cleaned = code.replaceAll(RegExp(r'\D'), '');
     if (cleaned.isEmpty) return 'Unknown item';
-    // A tiny, friendly fallback “namer”
     final last4 = cleaned.length >= 4
         ? cleaned.substring(cleaned.length - 4)
         : cleaned;
@@ -187,7 +195,6 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
   }
 
   Future<void> _scanBarcode() async {
-    // Placeholder UI: you can replace this with a camera scanner later.
     final ctrl = TextEditingController();
     await showModalBottomSheet<void>(
       context: context,
@@ -225,7 +232,11 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
                     final code = ctrl.text.trim();
                     final name = _nameFromBarcode(code);
                     if (name.isNotEmpty) {
-                      ShoppingService.instance.add(name);
+                      if (_usingWorkspace) {
+                        _repo.add(_workspaceId!, name);
+                      } else {
+                        LocalShoppingStore.instance.add(name);
+                      }
                     }
                     Navigator.pop(ctx);
                   },
@@ -243,50 +254,211 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
   // ── UI ─────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final items = ShoppingService.instance.items;
+    final uid = FirebaseAuth.instance.currentUser?.uid;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Shopping'),
-        actions: _removeMode
-            ? [
-                TextButton(
-                  onPressed: _selectedNames.isEmpty
-                      ? null
-                      : _confirmDeleteSelected,
-                  child: const Text('Delete selected'),
-                ),
-                IconButton(
-                  tooltip: 'Delete all',
-                  onPressed: _confirmDeleteAll,
-                  icon: const Icon(Icons.delete_forever),
-                ),
-                IconButton(
-                  tooltip: 'Cancel',
-                  onPressed: _exitRemoveMode,
-                  icon: const Icon(Icons.close),
-                ),
-              ]
-            : null,
-      ),
-      body: items.isEmpty
-          ? const Center(child: Text('No items yet'))
-          : ListView.separated(
+    Stream<DocumentSnapshot<Map<String, dynamic>>>? userDocStream;
+    if (uid != null) {
+      userDocStream = FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .snapshots();
+    }
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: userDocStream,
+      builder: (context, userSnap) {
+        if (userSnap.hasData) {
+          final userData = userSnap.data?.data() ?? const <String, dynamic>{};
+          final wsId = (userData['currentWorkspaceId'] as String?) ?? '';
+          final newWorkspace = wsId.isEmpty ? null : wsId;
+
+          // Detect workspace change
+          if (newWorkspace != _lastWorkspaceId) {
+            if (_lastWorkspaceId == null && newWorkspace != null) {
+              // Joining a workspace
+              ShoppingMigrationService.instance.migrateLocalToWorkspace(
+                newWorkspace,
+              );
+            } else if (_lastWorkspaceId != null && newWorkspace == null) {
+              // Leaving workspace
+              ShoppingMigrationService.instance.extractMineFromWorkspace(
+                _lastWorkspaceId!,
+              );
+            }
+            _lastWorkspaceId = newWorkspace;
+          }
+
+          _workspaceId = newWorkspace;
+        } else {
+          if (_lastWorkspaceId != null) {
+            // Handle sign-out scenario (also counts as leaving workspace)
+            ShoppingMigrationService.instance.extractMineFromWorkspace(
+              _lastWorkspaceId!,
+            );
+            _lastWorkspaceId = null;
+          }
+          _workspaceId = null;
+        }
+
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('Shopping'),
+            actions: _removeMode
+                ? [
+                    TextButton(
+                      onPressed: _confirmDeleteSelected,
+                      child: const Text('Delete selected'),
+                    ),
+                    IconButton(
+                      tooltip: 'Delete all',
+                      onPressed: _confirmDeleteAll,
+                      icon: const Icon(Icons.delete_forever),
+                    ),
+                    IconButton(
+                      tooltip: 'Cancel',
+                      onPressed: _exitRemoveMode,
+                      icon: const Icon(Icons.close),
+                    ),
+                  ]
+                : null,
+          ),
+          body: _usingWorkspace ? _buildFirestoreBody() : _buildLocalBody(),
+          floatingActionButton: _fab(context),
+          bottomNavigationBar: _removeMode
+              ? SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+                    child: Row(
+                      children: [
+                        Text('${_selectedIds.length} selected'),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () {
+                            // “Select all” implemented in each builder
+                            // by capturing the current list there.
+                          },
+                          child: const Text('Select all'),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: Colors.red,
+                          ),
+                          onPressed: _confirmDeleteSelected,
+                          child: const Text('Delete selected'),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : null,
+        );
+      },
+    );
+  }
+
+  // ── Firestore mode body ────────────────────────────────────────────────────
+  Widget _buildFirestoreBody() {
+    return StreamBuilder<List<ShoppingDoc>>(
+      stream: _repo.watch(_workspaceId!),
+      builder: (context, snap) {
+        final items = snap.data ?? const <ShoppingDoc>[];
+
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (items.isEmpty) {
+          return const Center(child: Text('No items yet'));
+        }
+
+        return ListView.separated(
+          itemCount: items.length,
+          separatorBuilder: (_, __) => const Divider(height: 0),
+          itemBuilder: (ctx, i) {
+            final it = items[i];
+
+            final leading = _removeMode
+                ? Checkbox(
+                    value: _selectedIds.contains(it.id),
+                    onChanged: (v) {
+                      setState(() {
+                        if (v == true) {
+                          _selectedIds.add(it.id);
+                        } else {
+                          _selectedIds.remove(it.id);
+                        }
+                      });
+                    },
+                  )
+                : null;
+
+            return ListTile(
+              leading: leading,
+              title: Text(
+                it.name,
+                style: it.done
+                    ? Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        decoration: TextDecoration.lineThrough,
+                      )
+                    : null,
+              ),
+              trailing: !_removeMode
+                  ? Checkbox(
+                      value: it.done,
+                      onChanged: (v) =>
+                          _repo.toggleDone(_workspaceId!, it.id, v ?? false),
+                    )
+                  : null,
+              onTap: _removeMode
+                  ? () {
+                      setState(() {
+                        if (_selectedIds.contains(it.id)) {
+                          _selectedIds.remove(it.id);
+                        } else {
+                          _selectedIds.add(it.id);
+                        }
+                      });
+                    }
+                  : null,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ── Local mode body (offline, no workspace) ────────────────────────────────
+  Widget _buildLocalBody() {
+    return FutureBuilder(
+      future: LocalShoppingStore.instance.ensureInitialized(),
+      builder: (context, _) {
+        return StreamBuilder<List<ShoppingDoc>>(
+          stream: LocalShoppingStore.instance.watch(),
+          builder: (context, snap) {
+            final items = snap.data ?? const <ShoppingDoc>[];
+
+            if (snap.connectionState == ConnectionState.waiting) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            if (items.isEmpty) {
+              return const Center(child: Text('No items yet'));
+            }
+
+            return ListView.separated(
               itemCount: items.length,
-              separatorBuilder: (_, _) => const Divider(height: 0),
+              separatorBuilder: (_, __) => const Divider(height: 0),
               itemBuilder: (ctx, i) {
                 final it = items[i];
 
-                // Leading selection checkbox only in remove mode
                 final leading = _removeMode
                     ? Checkbox(
-                        value: _selectedNames.contains(it.name),
+                        value: _selectedIds.contains(it.id),
                         onChanged: (v) {
                           setState(() {
                             if (v == true) {
-                              _selectedNames.add(it.name);
+                              _selectedIds.add(it.id);
                             } else {
-                              _selectedNames.remove(it.name);
+                              _selectedIds.remove(it.id);
                             }
                           });
                         },
@@ -306,61 +478,31 @@ class _ShoppingScreenState extends State<ShoppingScreen> {
                   trailing: !_removeMode
                       ? Checkbox(
                           value: it.done,
-                          onChanged: (v) =>
-                              setState(() => it.done = v ?? false),
+                          onChanged: (v) => LocalShoppingStore.instance
+                              .toggleDone(it.id, v ?? false),
                         )
                       : null,
                   onTap: _removeMode
                       ? () {
                           setState(() {
-                            if (_selectedNames.contains(it.name)) {
-                              _selectedNames.remove(it.name);
+                            if (_selectedIds.contains(it.id)) {
+                              _selectedIds.remove(it.id);
                             } else {
-                              _selectedNames.add(it.name);
+                              _selectedIds.add(it.id);
                             }
                           });
                         }
                       : null,
                 );
               },
-            ),
-      floatingActionButton: _fab(context),
-      bottomNavigationBar: _removeMode
-          ? SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-                child: Row(
-                  children: [
-                    Text('${_selectedNames.length} selected'),
-                    const Spacer(),
-                    TextButton(
-                      onPressed: () {
-                        // Select all currently visible
-                        final names = ShoppingService.instance.items.map(
-                          (e) => e.name,
-                        );
-                        setState(() => _selectedNames.addAll(names));
-                      },
-                      child: const Text('Select all'),
-                    ),
-                    const SizedBox(width: 8),
-                    FilledButton(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: Colors.red,
-                      ),
-                      onPressed: _selectedNames.isEmpty
-                          ? null
-                          : _confirmDeleteSelected,
-                      child: const Text('Delete selected'),
-                    ),
-                  ],
-                ),
-              ),
-            )
-          : null,
+            );
+          },
+        );
+      },
     );
   }
 
+  // ── FAB ────────────────────────────────────────────────────────────────────
   Widget _fab(BuildContext context) {
     return PopupMenuButton<_FabAction>(
       tooltip: 'Actions',

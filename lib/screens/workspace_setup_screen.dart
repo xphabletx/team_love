@@ -26,7 +26,7 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
   }
 
   // ---------------- helpers ----------------
-  void _requireSignedIn(VoidCallback action) {
+  Future<void> _requireSignedIn(Future<void> Function() action) async {
     final u = _user;
     if (u == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -34,7 +34,7 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
       );
       return;
     }
-    action();
+    await action();
   }
 
   Future<String?> _askForName({String initial = ''}) async {
@@ -78,7 +78,7 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
 
   // ---------------- create (single prompt) ----------------
   Future<void> _create() async {
-    _requireSignedIn(() async {
+    await _requireSignedIn(() async {
       final name = await _askForName();
       if (name == null || name.isEmpty) return;
 
@@ -214,7 +214,7 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
       ).showSnackBar(const SnackBar(content: Text('Enter an invite code')));
       return;
     }
-    _requireSignedIn(() async {
+    await _requireSignedIn(() async {
       setState(() => busy = true);
       try {
         final ok = await WorkspaceService.instance.joinWithCode(code);
@@ -241,20 +241,75 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
   }
 
   // ---------------- leave / delete ----------------
+  Future<void> _delete(String wsId, String name) async {
+    await _requireSignedIn(() async {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setLocal) {
+            bool localBusy = false;
+            return AlertDialog(
+              title: const Text('Delete workspace?'),
+              content: Text('This permanently deletes “$name”.'),
+              actions: [
+                TextButton(
+                  onPressed: localBusy ? null : () => Navigator.pop(ctx, false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                  onPressed: localBusy
+                      ? null
+                      : () async {
+                          setLocal(() => localBusy = true);
+                          try {
+                            await WorkspaceService.instance.deleteWorkspaceHard(
+                              wsId,
+                            );
+                            if (context.mounted) Navigator.pop(ctx, true);
+                          } catch (e) {
+                            setLocal(() => localBusy = false);
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text('Delete failed: $e')),
+                              );
+                            }
+                          }
+                        },
+                  child: localBusy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Delete'),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+      if (ok == true && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Deleted “$name”')));
+      }
+    });
+  }
+
   Future<void> _leave(String wsId, String name) async {
-    _requireSignedIn(() async {
+    await _requireSignedIn(() async {
       final ok = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('Leave workspace?'),
-          content: Text('You will leave “$name”. Others keep their data.'),
+          content: Text('You will leave “$name”. You can be re-invited later.'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx, false),
               child: const Text('Cancel'),
             ),
             FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.red),
               onPressed: () => Navigator.pop(ctx, true),
               child: const Text('Leave'),
             ),
@@ -262,66 +317,31 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
         ),
       );
       if (ok != true) return;
+
       try {
         await WorkspaceService.instance.leaveWorkspace(wsId);
         if (!mounted) return;
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('Left “$name”')));
+        ).showSnackBar(SnackBar(content: Text('Left “$name”.')));
       } catch (e) {
         if (!mounted) return;
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('Failed to leave: $e')));
-      }
-    });
-  }
-
-  Future<void> _delete(String wsId, String name) async {
-    _requireSignedIn(() async {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Delete workspace?'),
-          content: Text('This permanently deletes “$name”.'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.red),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Delete'),
-            ),
-          ],
-        ),
-      );
-      if (ok != true) return;
-      try {
-        await WorkspaceService.instance.deleteWorkspaceHard(wsId);
-        if (!mounted) return;
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Deleted “$name”')));
-      } catch (e) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Delete failed: $e')));
+        ).showSnackBar(SnackBar(content: Text('Leave failed: $e')));
       }
     });
   }
 
   // ---------------- role / kick ----------------
   Future<void> _changeRole(String wsId, String memberUid, String role) async {
-    _requireSignedIn(() async {
+    await _requireSignedIn(() async {
       await WorkspaceService.instance.setMemberRole(wsId, memberUid, role);
     });
   }
 
   Future<void> _removeMember(String wsId, String memberUid) async {
-    _requireSignedIn(() async {
+    await _requireSignedIn(() async {
       await WorkspaceService.instance.removeMember(wsId, memberUid);
     });
   }
@@ -436,7 +456,6 @@ class _WorkspaceSetupScreenState extends State<WorkspaceSetupScreen> {
                       ),
                     ],
                   ],
-
                   const Divider(height: 32),
                   FilledButton.icon(
                     onPressed: busy ? null : _create,
@@ -723,7 +742,7 @@ class _ConsentEditorScreenState extends State<ConsentEditorScreen> {
           return ListView.separated(
             padding: const EdgeInsets.all(16),
             itemCount: features.length,
-            separatorBuilder: (_, __) => const Divider(),
+            separatorBuilder: (_, i) => const Divider(), // lint fix
             itemBuilder: (_, i) {
               final f = features[i];
               final v = state[f] ?? current[f] ?? 'none';
