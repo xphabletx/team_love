@@ -22,3 +22,8 @@ ios/Runner/GoogleService-Info.plist
 Thumbs.db
 
 macos/Runner/GoogleService-Info.plist
+*.iml
+.flutter-plugins-dependencies
+
+*firebase-debug.log
+*firestore-debug.log
